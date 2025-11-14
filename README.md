@@ -48,8 +48,9 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
 ## Usage
 1. **Run the App**:
    ```
-   python3 voice_clone_app.py
+   ./voice_clone_app.py
    ```
+   (Or `python3 voice_clone_app.py` if preferred)
 
 2. **Select Voice**: The app fetches and lists available ElevenLabs voices. Enter the ID for your desired cloned voice (upload samples to ElevenLabs for custom cloning).
 
