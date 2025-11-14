@@ -3,7 +3,6 @@ import whisper
 import pyaudio
 import wave
 import os
-import subprocess
 from elevenlabs import ElevenLabs
 
 # Note: Set your ElevenLabs API key as environment variable ELEVENLABS_API_KEY
@@ -61,16 +60,17 @@ def text_to_cloned_voice(text, voice_id="21m00Tcm4TlvDq8ikWAM"):  # Default: Rac
     )
     with open("output.mp3", "wb") as f:
         f.write(audio)
-    print("Routing cloned voice to virtual microphone...")
-    # Route to virtual mic for use as device microphone in calls
-    subprocess.run(["mpg123", "-q", "-a", "virtual_mic", "output.mp3"])
+    print("Playing cloned voice...")
+    # On Linux, routes to virtual mic; on Windows, ensure default output is set to virtual cable input
+    from playsound import playsound
+    playsound.playsound("output.mp3")
     # Clean up
     os.remove("output.mp3")
 
 def main():
     print("Professional Speech to Cloned Voice App")
     print("Ultra-accurate STT with Whisper and glitch-free, natural TTS with ElevenLabs")
-    print("Optimized for high-end devices; zero delay, routed to virtual microphone for calls")
+    print("Optimized for high-end devices; zero delay, output routed to virtual microphone for calls")
     if not os.getenv('ELEVENLABS_API_KEY'):
         print("Please set ELEVENLABS_API_KEY environment variable")
         exit(1)
@@ -85,8 +85,8 @@ def main():
     if not voice_id:
         print("Voice ID is required for cloning.")
         exit(1)
-    print("Ensure virtual mic is set up: pactl load-module module-null-sink sink_name=virtual_mic sink_properties=device.description=VirtualMic")
-    print("And set default source: pactl set-default-source virtual_mic.monitor")
+    print("For Linux: Ensure virtual mic is set up with PulseAudio.")
+    print("For Windows: Install VB-Audio Virtual Cable, set default output to 'CABLE Input'.")
     while True:
         text = speech_to_text()
         if text:

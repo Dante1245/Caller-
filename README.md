@@ -10,11 +10,13 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
 - **Professional-Grade**: Suitable for real-world calls, presentations, or content creation.
 
 ## System Requirements
-- **OS**: Linux (tested on Kali/Debian; adaptable to Windows/macOS with tweaks).
+- **OS**: Linux (tested on Kali/Debian) or Windows (with VB-Audio Virtual Cable).
 - **Hardware**: High-end CPU/GPU (e.g., Alienware, gaming laptops) for optimal Whisper/ElevenLabs performance.
-- **Python**: 3.13+
+- **Python**: 3.13+ (install from python.org for Windows).
 - **APIs**: ElevenLabs API key (free tier available; premium for cloned voices).
-- **System Tools**: PulseAudio, mpg123, portaudio19-dev.
+- **System Tools**:
+  - Linux: PulseAudio, mpg123, portaudio19-dev.
+  - Windows: VB-Audio Virtual Cable (free virtual audio device).
 
 ## Installation
 1. **Install System Dependencies**:
@@ -33,6 +35,7 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
    ```
    pip install -r requirements.txt
    ```
+   On Windows, if issues with pyaudio, install from wheel or use conda.
 
 4. **Set Environment Variables**:
    ```
@@ -43,6 +46,21 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
    ```
    pactl load-module module-null-sink sink_name=virtual_mic sink_properties=device.description=VirtualMic
    pactl set-default-source virtual_mic.monitor
+   ```
+
+### Windows Setup
+1. **Install VB-Audio Virtual Cable**:
+   - Download from https://vb-audio.com/Cable/ (free).
+   - Install and reboot if needed.
+
+2. **Configure Audio**:
+   - Go to Sound settings > Playback > Set "CABLE Input (VB-Audio Virtual Cable)" as default output.
+   - In Recording, "CABLE Output (VB-Audio Virtual Cable)" will appear as mic input.
+   - In your call app (Zoom), select "CABLE Output" as microphone.
+
+3. **Set Environment Variable**:
+   ```
+   set ELEVENLABS_API_KEY=your-key
    ```
 
 ## Usage
@@ -56,8 +74,9 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
 
 3. **Operate**:
    - Speak into your microphone; the app records 5 seconds, transcribes accurately, and generates cloned audio.
-   - Cloned voice is routed to the virtual microphone.
-   - In your call app (e.g., Zoom), select "VirtualMic" as the input device.
+   - On Linux: Cloned voice routes to virtual mic.
+   - On Windows: Cloned voice plays to default output (CABLE Input), routing to CABLE Output as mic.
+   - In your call app (e.g., Zoom), select the virtual mic ("VirtualMic" on Linux, "CABLE Output" on Windows).
    - Loop for continuous use; press 'n' to stop.
 
 4. **For Professional Calls**: The virtual mic acts as your "voice" in meetings—speak naturally, output is cloned seamlessly.
@@ -68,10 +87,12 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
 - **TTS Model**: ElevenLabs turbo is optimized; switch to "eleven_monolingual_v1" if needed, but turbo is best for speed.
 
 ## Troubleshooting
-- **No Audio**: Ensure virtual mic is set up and selected in call apps.
+- **No Audio**: Ensure virtual mic is set up and selected in call apps (Linux: PulseAudio; Windows: VB-Cable).
 - **API Errors**: Check internet and API key validity.
 - **Latency**: On lower-end devices, consider GPU acceleration (install CUDA PyTorch).
 - **Voices Not Loading**: Verify ElevenLabs account has voices/clones.
+- **Windows pyaudio Issues**: Install from https://www.lfd.uci.edu/~gohlke/pythonlibs/#pyaudio or use conda.
+- **Windows Audio Not Routing**: Confirm VB-Cable devices are default in Sound settings.
 
 ## License
 MIT License - Free for personal/professional use.
