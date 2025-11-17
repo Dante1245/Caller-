@@ -2,3 +2,5 @@ openai-whisper
 elevenlabs
 pyaudio
 playsound
+noisereduce
+torch

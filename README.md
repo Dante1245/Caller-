@@ -3,11 +3,14 @@
 This advanced Python application leverages cutting-edge AI for ultra-accurate speech-to-text transcription and flawless voice cloning, designed for professional communications on high-performance devices like Alienware or gaming laptops.
 
 ## Features
-- **Ultra-Accurate STT**: OpenAI Whisper (small model) handles complex speech, accents, and noise with near-human precision.
-- **Glitch-Free TTS**: ElevenLabs (turbo model) delivers 100% natural, artifact-free voice cloning—no robotic sounds.
-- **Virtual Microphone Integration**: Routes output to PulseAudio virtual sink for use as device microphone in calls (Zoom, Teams, etc.).
-- **Low Latency**: Optimized for zero delay on high-end hardware, with 5-second recording cycles for responsive performance.
-- **Professional-Grade**: Suitable for real-world calls, presentations, or content creation.
+- **Real-Time Streaming STT**: Continuous listening with silence detection for instant processing—speak naturally without pauses.
+- **Ultra-Accurate STT**: OpenAI Whisper with GPU acceleration, multi-language support, and noise reduction for precision in any environment.
+- **Glitch-Free TTS**: ElevenLabs (turbo model) with stability/similarity settings for 100% natural, artifact-free voice cloning.
+- **Voice Cloning**: Clone new voices by recording samples and uploading to ElevenLabs for custom voices.
+- **Virtual Microphone Routing**: Outputs to virtual mic (PulseAudio/Linux or VB-Cable/Windows) for seamless use in calls.
+- **Transcript Logging**: Saves all conversations to transcripts.txt for review.
+- **Multi-Threaded Processing**: Concurrent recording and processing for ultra-low latency and efficiency.
+- **Extra Powerful**: Optimized for high-end hardware, scalable for professional or pentesting uses.
 
 ## System Requirements
 - **OS**: Linux (tested on Kali/Debian) or Windows (with VB-Audio Virtual Cable).
@@ -35,7 +38,7 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
    ```
    pip install -r requirements.txt
    ```
-   On Windows, if issues with pyaudio, install from wheel or use conda.
+   On Windows, if issues with pyaudio, install from wheel or use conda. For GPU acceleration, install PyTorch with CUDA if available.
 
 4. **Set Environment Variables**:
    ```
@@ -66,9 +69,22 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
 ## Usage
 1. **Run the App**:
    ```
-   ./voice_clone_app.py
+   python3 voice_clone_app.py
    ```
-   (Or `python3 voice_clone_app.py` if preferred)
+
+2. **Select Voice**:
+   - List available voices.
+   - Option to clone a new voice by recording samples.
+   - Enter voice ID or use cloned one.
+
+3. **Real-Time Operation**:
+   - App starts listening continuously.
+   - Speak and pause; app transcribes, clones, and plays in real-time.
+   - Press Ctrl+C to stop.
+
+4. **For Calls**:
+   - Select virtual mic in Zoom/Teams.
+   - Cloned voice routes seamlessly.
 
 2. **Select Voice**: The app fetches and lists available ElevenLabs voices. Enter the ID for your desired cloned voice (upload samples to ElevenLabs for custom cloning).
 
