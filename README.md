@@ -122,4 +122,4 @@ Fork, improve, and submit PRs. Ensure tests on high-end hardware.
 
 ---
 
-Built with HackerAI for flawless, professional voice cloning.
+Built by Dante for flawless, professional voice cloning.
