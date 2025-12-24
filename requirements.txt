@@ -4,3 +4,4 @@ pyaudio
 playsound
 noisereduce
 torch
+vaderSentiment

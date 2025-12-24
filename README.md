@@ -5,10 +5,12 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
 ## Features
 - **Real-Time Streaming STT**: Continuous listening with silence detection for instant processing—speak naturally without pauses.
 - **Ultra-Accurate STT**: OpenAI Whisper with GPU acceleration, multi-language support, and noise reduction for precision in any environment.
-- **Glitch-Free TTS**: ElevenLabs (turbo model) with stability/similarity settings for 100% natural, artifact-free voice cloning.
+- **Per-Word Insights**: Whisper word-level timestamps printed and logged for precise call analytics and debugging.
+- **Mood-Adaptive TTS**: VADER sentiment detects tone per utterance and tunes ElevenLabs stability/similarity automatically.
+- **Glitch-Free TTS**: ElevenLabs (turbo model) with adaptive stability/similarity settings for 100% natural, artifact-free voice cloning.
 - **Voice Cloning**: Clone new voices by recording samples and uploading to ElevenLabs for custom voices.
 - **Virtual Microphone Routing**: Outputs to virtual mic (PulseAudio/Linux or VB-Cable/Windows) for seamless use in calls.
-- **Transcript Logging**: Saves all conversations to transcripts.txt for review.
+- **Transcript Logging**: Saves all conversations to transcripts.txt for review, including mood and word-level timing metadata.
 - **Multi-Threaded Processing**: Concurrent recording and processing for ultra-low latency and efficiency.
 - **Extra Powerful**: Optimized for high-end hardware, scalable for professional or pentesting uses.
 
@@ -101,6 +103,8 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
 - **Recording Duration**: Edit `duration=5` in `record_audio()` for shorter/longer clips (affects latency).
 - **Whisper Model**: Change to "base" for faster but less accurate STT, or "medium" for even higher precision (requires more resources).
 - **TTS Model**: ElevenLabs turbo is optimized; switch to "eleven_monolingual_v1" if needed, but turbo is best for speed.
+- **Mood + Analytics**: Sentiment analysis runs automatically; transcripts include mood score and per-word timestamps for each turn.
+- **Latency Tuning**: Silence and buffer thresholds are set for speed. Adjust `SILENCE_CHUNKS` or `MIN_BUFFER_CHUNKS` in `voice_clone_app.py` if you want to trade speed for longer context.
 
 ## Troubleshooting
 - **No Audio**: Ensure virtual mic is set up and selected in call apps (Linux: PulseAudio; Windows: VB-Cable).
