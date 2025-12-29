@@ -41,7 +41,16 @@ SILENCE_CHUNKS = 8  # shorter silence window for snappier responses
 MIN_BUFFER_CHUNKS = 40  # lower minimum to ship faster to Whisper
 
 def record_sample(duration=5, filename=None):
-    """Capture a short, high-fidelity sample for cloning."""
+    """
+    Record a short high-fidelity WAV sample suitable for voice cloning.
+    
+    Parameters:
+        duration (int | float): Length of the recording in seconds (default 5).
+        filename (str | None): Destination filepath for the WAV file; if None a timestamped filename is generated.
+    
+    Returns:
+        str: Path to the written WAV file.
+    """
     if not filename:
         filename = f"sample_{time.time()}.wav"
 
@@ -72,14 +81,30 @@ def record_sample(duration=5, filename=None):
     return filename
 
 def is_silent(data, threshold=500):
-    """Check if audio data is silent based on RMS."""
+    """
+    Determine whether a PCM16 audio frame is silent by comparing its root-mean-square (RMS) amplitude to a threshold.
+    
+    Parameters:
+        data (bytes): Raw audio bytes containing 16-bit PCM samples (int16).
+        threshold (float): RMS amplitude cutoff; returns `True` when computed RMS is less than this value.
+    
+    Returns:
+        bool: `True` if the frame's RMS is less than `threshold`, `False` otherwise.
+    """
     audio_data = np.frombuffer(data, dtype=np.int16)
     rms = np.sqrt(np.mean(audio_data ** 2))
     return rms < threshold
 
 
 def get_device_and_model():
-    """Pick the fastest Whisper model based on available hardware."""
+    """
+    Selects and loads a Whisper transcription model appropriate for the current hardware.
+    
+    The function chooses a model variant based on whether a CUDA GPU is available, loads that Whisper model onto the selected device, and returns the ready-to-use model instance.
+    
+    Returns:
+        model: A Whisper model instance loaded onto the selected device (GPU if available, otherwise CPU).
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     preferred_model = "small.en" if device == "cuda" else "base"
     print(f"Loading Whisper model '{preferred_model}' on {device} for low latency...")
@@ -88,7 +113,17 @@ def get_device_and_model():
 
 
 def analyze_mood(text):
-    """Return mood label and compound score using VADER."""
+    """
+    Determine overall mood and return the VADER compound sentiment score.
+    
+    Computes VADER polarity scores for the supplied text and maps the compound score to a mood label using thresholds: compound >= 0.3 -> "positive", compound <= -0.3 -> "negative", otherwise "neutral".
+    
+    Parameters:
+        text (str): Text to analyze for sentiment.
+    
+    Returns:
+        tuple: (mood, compound) where `mood` is one of "positive", "negative", or "neutral", and `compound` is the VADER compound score as a float.
+    """
     scores = sentiment_analyzer.polarity_scores(text)
     compound = scores.get("compound", 0)
     if compound >= 0.3:
@@ -101,7 +136,15 @@ def analyze_mood(text):
 
 
 def adaptive_voice_settings(mood):
-    """Tune ElevenLabs settings per detected mood for more authentic prosody."""
+    """
+    Map a detected mood to ElevenLabs voice synthesis settings.
+    
+    Parameters:
+        mood (str): Detected mood label, expected values include "positive", "negative", or "neutral".
+    
+    Returns:
+        dict: A preset containing `stability` and `similarity_boost` values for the given mood. If `mood` is unrecognized, returns the "neutral" preset.
+    """
     presets = {
         "positive": {"stability": 0.8, "similarity_boost": 0.85},
         "negative": {"stability": 0.65, "similarity_boost": 0.75},
@@ -111,7 +154,18 @@ def adaptive_voice_settings(mood):
 
 
 def extract_word_timestamps(result):
-    """Flatten Whisper word timestamps for analytics and per-word monitoring."""
+    """
+    Extract per-word timing entries from a Whisper transcription result.
+    
+    Parameters:
+        result (dict): Whisper transcription output containing a "segments" list; each segment may include a "words" list with per-word timing dictionaries.
+    
+    Returns:
+        list: A list of dictionaries, each with keys:
+            - "word" (str): The word text (trimmed).
+            - "start" (float|None): Word start time in seconds, or None if unavailable.
+            - "end" (float|None): Word end time in seconds, or None if unavailable.
+    """
     word_timings = []
     for segment in result.get("segments", []):
         for word in segment.get("words", []) or []:
@@ -125,7 +179,15 @@ def extract_word_timestamps(result):
     return word_timings
 
 def real_time_record(audio_queue, stop_event):
-    """Continuously record audio, detect silence, and enqueue denoised clips."""
+    """
+    Continuously capture live audio, split utterances by silence, apply noise reduction, save each clip to a temporary WAV file, and enqueue the filename for downstream processing.
+    
+    This function runs until stop_event is set. When a sustained silence follows recorded audio, the buffered audio is denoised, written to a temporary 16-bit WAV file, and the file path is put onto audio_queue.
+    
+    Parameters:
+        audio_queue (queue.Queue): Queue to receive paths of created WAV files for downstream consumers.
+        stop_event (threading.Event): Event used to signal shutdown; recording stops when this event is set.
+    """
     pa = pyaudio.PyAudio()
     stream = pa.open(
         format=SAMPLE_FORMAT,
@@ -164,6 +226,15 @@ def real_time_record(audio_queue, stop_event):
 
 
 def log_transcript(text, mood, compound, word_timings):
+    """
+    Append a timestamped transcript entry to transcripts.txt containing the transcribed text, detected mood and compound score, and optional per-word timings.
+    
+    Parameters:
+        text (str): The transcribed text to record.
+        mood (str): The mood label determined for the text (e.g., "positive", "negative", "neutral").
+        compound (float): The VADER compound sentiment score associated with the text.
+        word_timings (list[dict] | None): Optional list of word timing dictionaries with keys 'word', 'start', and 'end'; when provided, each word is logged as `word@start-end` with times in seconds.
+    """
     timestamp = time.ctime()
     with open("transcripts.txt", "a") as f:
         f.write(f"{timestamp} | mood={mood} ({compound:.3f}) | text={text}\n")
@@ -181,6 +252,19 @@ def log_transcript(text, mood, compound, word_timings):
 
 
 def process_audio(audio_queue, voice_id, stop_event):
+    """
+    Process audio files from a queue: transcribe each file, detect mood and per-word timings, synthesize and play a mood-adaptive cloned voice, and persist a transcript.
+    
+    Parameters:
+        audio_queue (queue.Queue): Queue that yields file paths to audio files to process.
+        voice_id (str): ElevenLabs voice identifier used for synthesized playback.
+        stop_event (threading.Event): Event that, when set, causes the processing loop to exit.
+    
+    Behavior:
+        - Continuously reads audio file paths from `audio_queue` until `stop_event` is set.
+        - For each audio file, obtains a transcription, determines overall mood and compound score, extracts per-word timestamps, prints transcription and timing information to stdout, synthesizes and plays the cloned voice using the detected mood, and logs the transcript and timings.
+        - Deletes each processed audio file after handling it.
+    """
     model = get_device_and_model()
     while not stop_event.is_set():
         audio_file = None
@@ -213,7 +297,14 @@ def process_audio(audio_queue, voice_id, stop_event):
 
 
 def text_to_cloned_voice(text, voice_id="21m00Tcm4TlvDq8ikWAM", mood="neutral"):
-    """Send text to ElevenLabs with adaptive settings and stream playback."""
+    """
+    Generate and play cloned-voice audio using ElevenLabs with mood-adaptive voice settings.
+    
+    Parameters:
+        text (str): The text to synthesize into speech.
+        voice_id (str): ElevenLabs voice identifier to use for synthesis. Defaults to the common cloned-voice ID.
+        mood (str): Mood label that adjusts voice synthesis presets; expected values include "positive", "negative", and "neutral".
+    """
     settings = adaptive_voice_settings(mood)
     audio = client.generate(
         text=text,
@@ -229,6 +320,14 @@ def text_to_cloned_voice(text, voice_id="21m00Tcm4TlvDq8ikWAM", mood="neutral"):
     play(audio)
 
 def main():
+    """
+    Start the interactive real-time speech-to-cloned-voice application.
+    
+    Performs environment validation, optionally clones a new ElevenLabs voice from recorded samples or accepts an existing voice ID,
+    and then runs the real-time pipeline that records audio, transcribes with Whisper, analyzes mood, synthesizes cloned voice output,
+    and logs transcripts with per-word timestamps. Lists available voices when possible, instructs about virtual mic setup, launches
+    recording and processing threads, and waits for Ctrl+C to stop and clean up resources.
+    """
     print("Powerful Real-Time Speech to Cloned Voice App")
     print("Whisper STT + ElevenLabs cloned voice with adaptive mood and per-word tracking")
     print("GPU-aware, noise-reduced, and tuned for the lowest possible call latency")
