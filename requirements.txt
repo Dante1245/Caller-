@@ -7,4 +7,3 @@ TTS
 sounddevice
 soundfile
 elevenlabs
-playsound==1.2.2

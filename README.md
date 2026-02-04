@@ -112,7 +112,6 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
 - **Latency Tuning**: Adjust `--silence-chunks` or `--min-buffer-chunks` for faster/longer turns.
 
 ## Troubleshooting
-- **playsound Build Error**: If pip fails building playsound 1.3.x, this repo pins `playsound==1.2.2` in `requirements.txt` (pure Python) to avoid build issues.
 - **No Audio**: Ensure virtual mic is set up and selected in call apps (Linux: PulseAudio; Windows: VB-Cable).
 - **Model Download**: The first run may download XTTS model weights; ensure internet access.
 - **Latency**: On lower-end devices, consider GPU acceleration (install CUDA PyTorch).
