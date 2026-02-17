@@ -70,6 +70,7 @@ class AppConfig:
     playback_block_size: int
     engine: str
     elevenlabs_voice_id: str | None
+    force_cpu: bool
 
 
 class StatusBus:
@@ -144,10 +145,10 @@ def is_silent(data, threshold=500):
     return rms < threshold
 
 
-def get_device_and_model(model_name=None):
+def get_device_and_model(model_name=None, force_cpu=False):
     """Pick the fastest Whisper model based on available hardware."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    preferred_model = model_name or ("small.en" if device == "cuda" else "base")
+    device = "cpu" if force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
+    preferred_model = model_name or ("small.en" if device == "cuda" else "tiny.en")
     print(f"Loading Whisper model '{preferred_model}' on {device} for low latency...")
     model = whisper.load_model(preferred_model, device=device)
     return model
@@ -274,13 +275,13 @@ def log_transcript(text, mood, compound, word_timings):
 
 
 def process_audio(audio_queue, stop_event, config: AppConfig, status_bus: StatusBus):
-    model = get_device_and_model(config.model_name)
+    model = get_device_and_model(config.model_name, force_cpu=config.force_cpu)
     tts_engine = None
     gain_controller = None
     playback = None
     elevenlabs_engine = None
     if config.engine == "local":
-        tts_engine = LocalTTS(model_name=config.tts_model)
+        tts_engine = LocalTTS(model_name=config.tts_model, device="cpu" if config.force_cpu else None)
         gain_controller = AdaptiveGain(config.playback_gain)
         playback = PlaybackEngine(
             PlaybackConfig(
@@ -305,7 +306,7 @@ def process_audio(audio_queue, stop_event, config: AppConfig, status_bus: Status
                 audio_file,
                 language=config.language,
                 word_timestamps=True,
-                fp16=torch.cuda.is_available(),
+                fp16=torch.cuda.is_available() and not config.force_cpu,
                 temperature=0.0,
                 best_of=1,
                 beam_size=1,
@@ -520,10 +521,11 @@ def parse_args():
     )
     parser.add_argument(
         "--performance-mode",
-        choices=["balanced", "max"],
+        choices=["balanced", "max", "cpu"],
         default="balanced",
-        help="Performance preset for high-end machines (default: balanced).",
+        help="Performance preset: balanced, max, or cpu (default: balanced).",
     )
+    parser.add_argument("--force-cpu", action="store_true", help="Run STT/TTS on CPU even when CUDA is available.")
     parser.add_argument("--playback-device", type=int, default=None)
     parser.add_argument("--playback-block-size", type=int, default=2048)
     parser.add_argument("--self-check", action="store_true", help="Run diagnostics and exit.")
@@ -543,6 +545,8 @@ def main():
     preset = select_preset(args.performance_mode)
     if args.performance_mode == "max":
         print("Performance mode: MAX (noise reduction disabled, lower buffers).")
+    elif args.performance_mode == "cpu" or args.force_cpu:
+        print("Performance mode: CPU-friendly settings enabled.")
 
     devices = list_input_devices()
     if devices:
@@ -630,6 +634,7 @@ def main():
         playback_block_size=args.playback_block_size,
         engine=args.engine,
         elevenlabs_voice_id=elevenlabs_voice_id,
+        force_cpu=args.force_cpu or args.performance_mode == "cpu",
     )
 
     if args.ui:

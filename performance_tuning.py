@@ -15,6 +15,7 @@ class PerformancePreset:
 PRESETS = {
     "balanced": PerformancePreset(silence_chunks=8, min_buffer_chunks=40, use_noise_reduction=True),
     "max": PerformancePreset(silence_chunks=5, min_buffer_chunks=28, use_noise_reduction=False),
+    "cpu": PerformancePreset(silence_chunks=10, min_buffer_chunks=56, use_noise_reduction=False),
 }
 
 

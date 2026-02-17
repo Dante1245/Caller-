@@ -15,7 +15,10 @@ class TTSResult:
 
 class LocalTTS:
     def __init__(self, model_name: str | None = None, device: str | None = None) -> None:
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        requested_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if requested_device == "cuda" and not torch.cuda.is_available():
+            requested_device = "cpu"
+        self.device = requested_device
         self.model_name = model_name or "tts_models/multilingual/multi-dataset/xtts_v2"
         self.tts = TTS(model_name=self.model_name).to(self.device)
         self.output_sample_rate = self.tts.synthesizer.output_sample_rate
