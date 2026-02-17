@@ -13,7 +13,7 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
 - **Normalized Speaker Audio**: The reference WAV is normalized and stored under `normalized_speakers/` for consistent cloning quality.
 - **Voice Cloning Samples**: Record a short speaker WAV locally and use it as the cloning reference.
 - **Self-Improvement Hints**: Optional `--auto-upgrade` mode emits tuning recommendations from live usage analytics.
-- **Performance Presets**: Use `--performance-mode max` for lowest latency on high-end PCs, or `--performance-mode cpu` for CPU-friendly defaults.
+- **Performance Presets**: Use `--performance-mode max` for lowest latency on high-end PCs, or `--performance-mode cpu` for CPU-friendly defaults tuned for stronger quality.
 - **Low-Latency Playback**: Optional output streaming via `--playback-device` and `--playback-block-size`.
 - **Self Check**: Run `--self-check` to validate dependencies, GPU visibility, and audio devices.
 - **Virtual Microphone Routing**: Outputs to virtual mic (PulseAudio/Linux or VB-Cable/Windows) for seamless use in calls.
@@ -99,13 +99,13 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
    Use Start/Stop to control the pipeline while monitoring live status updates.
 
 ## Configuration
-- **Whisper Model**: Pass `--model` to force a model (e.g. `--model base`), or let the app auto-pick based on GPU.
+- **Whisper Model**: Pass `--model` to force a model (e.g. `--model base.en`), or let the app auto-pick. CPU mode now defaults to `base.en` for better transcription quality.
 - **TTS Model**: Override XTTS with `--tts-model` if you want a different local model.
 - **Noise Reduction**: Disable for speed with `--no-noise-reduction`.
 - **Device Selection**: Use `--device-index` to bind to a specific input device (list indexes in app output).
 - **Profiles**: Name the saved tuning profile with `--profile-name` (saved in `voice_profiles.json`).
 - **Auto-Upgrade Hints**: Enable with `--auto-upgrade` to surface recommendations in `usage_report.json`.
-- **Performance**: Use `--performance-mode max` for faster turn-taking on strong GPUs, or `--performance-mode cpu` / `--force-cpu` on CPU-only devices.
+- **Performance**: Use `--performance-mode max` for faster turn-taking on strong GPUs, or `--performance-mode cpu` / `--force-cpu` on CPU-only devices. CPU preset now keeps noise reduction enabled for cleaner call audio.
 - **Playback Routing**: Use `--playback-device` to select output device, and `--playback-block-size` to tune stream buffering.
 - **Engine Selection**: Use `--engine local` or `--engine elevenlabs` to pick the voice cloning backend.
 - **Diagnostics**: Run `--self-check` to print a JSON readiness report.

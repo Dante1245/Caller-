@@ -27,7 +27,11 @@ from usage_analytics import (
     start_session,
     update_report,
 )
-from performance_tuning import apply_torch_performance_settings, select_preset
+from performance_tuning import (
+    apply_cpu_performance_settings,
+    apply_torch_performance_settings,
+    select_preset,
+)
 from self_check import render_report, run_self_check
 """
 Ultra-low-latency, sentiment-aware voice cloning pipeline.
@@ -148,8 +152,8 @@ def is_silent(data, threshold=500):
 def get_device_and_model(model_name=None, force_cpu=False):
     """Pick the fastest Whisper model based on available hardware."""
     device = "cpu" if force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
-    preferred_model = model_name or ("small.en" if device == "cuda" else "tiny.en")
-    print(f"Loading Whisper model '{preferred_model}' on {device} for low latency...")
+    preferred_model = model_name or ("small.en" if device == "cuda" else "base.en")
+    print(f"Loading Whisper model '{preferred_model}' on {device} for optimized quality/latency...")
     model = whisper.load_model(preferred_model, device=device)
     return model
 
@@ -542,6 +546,8 @@ def main():
         print(json.dumps(report, indent=2))
         return
     apply_torch_performance_settings()
+    if args.performance_mode == "cpu" or args.force_cpu:
+        apply_cpu_performance_settings()
     preset = select_preset(args.performance_mode)
     if args.performance_mode == "max":
         print("Performance mode: MAX (noise reduction disabled, lower buffers).")
