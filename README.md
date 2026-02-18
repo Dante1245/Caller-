@@ -56,6 +56,38 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
    pactl set-default-source virtual_mic.monitor
    ```
 
+### CPU-Only Installation Guide (Linux / Windows / macOS)
+Use this path if you do not have a dedicated GPU.
+
+1. **Create and activate a virtual environment**:
+   ```
+   python -m venv .venv
+   ```
+   Linux/macOS:
+   ```
+   source .venv/bin/activate
+   ```
+   Windows (PowerShell):
+   ```
+   .\.venv\Scripts\Activate.ps1
+   ```
+
+2. **Install CPU-only PyTorch first**:
+   ```
+   pip install --upgrade pip
+   pip install torch --index-url https://download.pytorch.org/whl/cpu
+   ```
+
+3. **Install remaining project dependencies**:
+   ```
+   pip install -r requirements.txt
+   ```
+
+4. **Run CPU mode for best quality/performance balance**:
+   ```
+   python3 voice_clone_app.py --engine local --speaker-wav ./my_voice.wav --performance-mode cpu --force-cpu
+   ```
+
 ### Windows Setup
 1. **Install VB-Audio Virtual Cable**:
    - Download from https://vb-audio.com/Cable/ (free).
