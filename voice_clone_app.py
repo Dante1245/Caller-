@@ -158,6 +158,17 @@ def get_device_and_model(model_name=None, force_cpu=False):
     return model
 
 
+def resolve_whisper_model(model_name=None, force_cpu=False, quality_mode="balanced"):
+    """Select Whisper model with CPU/GPU-aware quality defaults."""
+    if model_name:
+        return model_name
+    if force_cpu:
+        return "small.en" if quality_mode == "high" else "base.en"
+    if torch.cuda.is_available():
+        return "medium.en" if quality_mode == "high" else "small.en"
+    return "small.en" if quality_mode == "high" else "base.en"
+
+
 def analyze_mood(text):
     """Return mood label and compound score using VADER."""
     scores = sentiment_analyzer.polarity_scores(text)
@@ -510,6 +521,12 @@ def parse_args():
     )
     parser.add_argument("--tts-model", default=None, help="Coqui TTS model name.")
     parser.add_argument("--model", default=None, help="Whisper model name (default: auto).")
+    parser.add_argument(
+        "--quality-mode",
+        choices=["balanced", "high"],
+        default="balanced",
+        help="Quality profile for model auto-selection (default: balanced).",
+    )
     parser.add_argument("--language", default="en", help="Language for XTTS (default: en).")
     parser.add_argument("--elevenlabs-voice-id", default=None, help="ElevenLabs voice ID.")
     parser.add_argument("--elevenlabs-clone-name", default="LocalClone", help="Name for ElevenLabs cloned voice.")
@@ -553,6 +570,14 @@ def main():
         print("Performance mode: MAX (noise reduction disabled, lower buffers).")
     elif args.performance_mode == "cpu" or args.force_cpu:
         print("Performance mode: CPU-friendly settings enabled.")
+
+    force_cpu = args.force_cpu or args.performance_mode == "cpu"
+    resolved_model = resolve_whisper_model(
+        model_name=args.model,
+        force_cpu=force_cpu,
+        quality_mode=args.quality_mode,
+    )
+    print(f"Using Whisper model: {resolved_model}")
 
     devices = list_input_devices()
     if devices:
@@ -625,7 +650,7 @@ def main():
     config = AppConfig(
         speaker_wav=normalized_wav if args.engine == "local" else "",
         tts_model=args.tts_model,
-        model_name=args.model,
+        model_name=resolved_model,
         language=args.language,
         use_noise_reduction=not args.no_noise_reduction and preset.use_noise_reduction,
         silence_chunks=args.silence_chunks if args.silence_chunks is not None else preset.silence_chunks,
@@ -640,7 +665,7 @@ def main():
         playback_block_size=args.playback_block_size,
         engine=args.engine,
         elevenlabs_voice_id=elevenlabs_voice_id,
-        force_cpu=args.force_cpu or args.performance_mode == "cpu",
+        force_cpu=force_cpu,
     )
 
     if args.ui:

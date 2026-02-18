@@ -23,7 +23,7 @@ This advanced Python application leverages cutting-edge AI for ultra-accurate sp
 - **Lightweight Control UI**: Optional Tkinter control panel to start/stop the pipeline and monitor status.
 
 ## System Requirements
-- **OS**: Linux (tested on Kali/Debian) or Windows (with VB-Audio Virtual Cable).
+- **OS**: Linux, Windows, and macOS.
 - **Hardware**: Works on CPU-only systems and also benefits from dedicated GPUs for faster real-time performance.
 - **Python**: 3.13+ (install from python.org for Windows).
 - **Models**: Coqui XTTS v2 (downloaded on first run).
@@ -85,7 +85,26 @@ Use this path if you do not have a dedicated GPU.
 
 4. **Run CPU mode for best quality/performance balance**:
    ```
-   python3 voice_clone_app.py --engine local --speaker-wav ./my_voice.wav --performance-mode cpu --force-cpu
+   python3 voice_clone_app.py --engine local --speaker-wav ./my_voice.wav --performance-mode cpu --force-cpu --quality-mode high
+   ```
+
+### macOS Setup
+1. **Install system dependencies (Homebrew)**:
+   ```
+   brew install portaudio ffmpeg
+   ```
+
+2. **Install Python dependencies**:
+   ```
+   pip install -r requirements.txt
+   ```
+
+3. **Grant permissions**:
+   - System Settings → Privacy & Security → **Microphone**: allow Terminal/iTerm/your Python IDE.
+
+4. **Run in CPU mode or auto mode**:
+   ```
+   python3 voice_clone_app.py --engine local --speaker-wav ./my_voice.wav --performance-mode cpu --force-cpu --quality-mode high
    ```
 
 ### Windows Setup
@@ -106,7 +125,7 @@ Use this path if you do not have a dedicated GPU.
    Optional quick start with arguments:
    ```
    python3 voice_clone_app.py --engine local --speaker-wav ./my_voice.wav --model base --device-index 1 --profile-name my_voice
-   python3 voice_clone_app.py --engine local --speaker-wav ./my_voice.wav --performance-mode cpu --force-cpu
+   python3 voice_clone_app.py --engine local --speaker-wav ./my_voice.wav --performance-mode cpu --force-cpu --quality-mode high
    python3 voice_clone_app.py --engine elevenlabs --speaker-wav ./my_voice.wav --elevenlabs-clone-name MyClone
    ```
 
@@ -132,6 +151,7 @@ Use this path if you do not have a dedicated GPU.
 
 ## Configuration
 - **Whisper Model**: Pass `--model` to force a model (e.g. `--model base.en`), or let the app auto-pick. CPU mode now defaults to `base.en` for better transcription quality.
+- **Quality Mode**: Use `--quality-mode balanced|high` to control auto model selection (`high` picks stronger models, especially useful on gaming PCs and higher-core CPUs).
 - **TTS Model**: Override XTTS with `--tts-model` if you want a different local model.
 - **Noise Reduction**: Disable for speed with `--no-noise-reduction`.
 - **Device Selection**: Use `--device-index` to bind to a specific input device (list indexes in app output).
