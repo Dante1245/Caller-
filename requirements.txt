@@ -1,7 +1,10 @@
 openai-whisper
-elevenlabs
 pyaudio
-playsound
 noisereduce
 torch
+vaderSentiment
+TTS
+sounddevice
+soundfile
+elevenlabs
 vaderSentiment
