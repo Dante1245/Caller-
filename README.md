@@ -1,14 +1,15 @@
 # Caller
 
-A desktop and command-line speech-to-voice pipeline: record a phrase, transcribe it
-with local Whisper, then optionally synthesize it using a reference voice with
-local XTTS or an ElevenLabs voice. Windows, macOS and Linux are supported by the
-code; device compatibility and latency depend on your machine.
+Caller combines a desktop voice studio with three voice engines:
 
-This is phrase-based processing, not simultaneous speech conversion. Model accuracy,
-voice similarity and real-time performance are not guaranteed. The intent, mood,
-and quality indicators are heuristics, not measurements of a person's emotions or
-of voice-cloning accuracy. Use a voice you own or have permission to use.
+- **Live conversion:** continuous microphone → w-okada voice-changer → virtual microphone, preserving delivery without a transcription step.
+- **Local XTTS:** phrase transcription and resynthesis from a reference sample.
+- **ElevenLabs:** phrase transcription and cloud voice synthesis.
+
+The live bridge requires a separate compatible w-okada server and a loaded voice
+model. See [live-call setup and compatibility](LIVE_CALLS.md). Voice similarity and
+latency depend on the model and hardware; use a voice you own or have permission to use.
+Intent, mood and quality indicators are heuristics, not measures of voice similarity.
 
 ## Install
 

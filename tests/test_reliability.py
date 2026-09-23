@@ -107,7 +107,7 @@ def test_worker_failure_stops_recorder_before_open(monkeypatch):
     monkeypatch.setattr(app, "process_audio", fail)
     monkeypatch.setattr(app, "real_time_record", recorder)
     bus = app.StatusBus()
-    stop, record, process = app.start_threads(SimpleNamespace(), bus)
+    stop, record, process = app.start_threads(SimpleNamespace(engine="local", run_mode="test"), bus)
     record.join(2)
     process.join(2)
     assert not record.is_alive() and not process.is_alive()

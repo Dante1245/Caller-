@@ -94,6 +94,8 @@ class AppConfig:
     voice_speed: float = 1.0
     max_clip_seconds: float = 30.0
     max_queue_seconds: float = 10.0
+    vc_url: str = "http://127.0.0.1:18888"
+    vc_block_size: int = 8192
 
 
 class StatusBus:
@@ -535,6 +537,11 @@ def resolve_device_index(requested):
 
 
 def start_threads(config: AppConfig, status_bus: StatusBus):
+    if config.engine == "voice-changer" and config.run_mode == "live":
+        from voice_changer_engine import start_live_threads
+        return start_live_threads(config, status_bus)
+    with status_bus.lock:
+        status_bus.metrics.pop("conversion_ms", None)
     audio_queue = queue.Queue(maxsize=3)
     stop_event = threading.Event()
     stop_event.ready = threading.Event()
@@ -597,6 +604,8 @@ def run_control_ui(config: AppConfig):
     model_var = tk.StringVar(root, value=config.model_name)
     language_var = tk.StringVar(root, value="auto" if config.auto_language else config.language)
     engine_var = tk.StringVar(root, value=config.engine)
+    vc_url_var = tk.StringVar(root, value=config.vc_url)
+    vc_block_var = tk.StringVar(root, value=str(config.vc_block_size))
     voice_var = tk.StringVar(root, value=config.elevenlabs_voice_id or "")
     cloud_model_var = tk.StringVar(root, value=config.elevenlabs_model)
     speed_var = tk.StringVar(root, value=str(config.voice_speed))
@@ -634,6 +643,8 @@ def run_control_ui(config: AppConfig):
             language="en" if language == "auto" else language,
             auto_language=language == "auto",
             engine=engine_var.get(),
+            vc_url=vc_url_var.get().strip(),
+            vc_block_size=int(vc_block_var.get()),
             elevenlabs_voice_id=voice_var.get().strip() or None,
             elevenlabs_model=cloud_model_var.get().strip(),
             voice_speed=speed,
@@ -926,9 +937,14 @@ def run_control_ui(config: AppConfig):
                     status_bus.emit(warning)
         metrics = status_bus.snapshot()
         meter["value"] = max(0, min(100, (metrics["rms_dbfs"] + 60) / 60 * 100))
-        metrics_var.set(
-            f"Input {metrics['rms_dbfs']:.0f} dBFS · {metrics['utterances']} phrases · {metrics['dropped']} dropped · {metrics.get('latency_ms', 0):.0f} ms"
-        )
+        if "conversion_ms" in metrics:
+            metrics_var.set(
+                f"Input {metrics['rms_dbfs']:.0f} dBFS · {metrics['dropped']} dropped · conversion {metrics['conversion_ms']:.0f} ms"
+            )
+        else:
+            metrics_var.set(
+                f"Input {metrics['rms_dbfs']:.0f} dBFS · {metrics['utterances']} phrases · {metrics['dropped']} dropped · {metrics.get('latency_ms', 0):.0f} ms"
+            )
         log.configure(state="normal")
         while True:
             try:
@@ -1015,7 +1031,7 @@ def run_control_ui(config: AppConfig):
         True,
     )
     field(1, 0, "Language", language_var)
-    field(1, 2, "Voice engine", engine_var, ["local", "elevenlabs"])
+    field(1, 2, "Voice engine", engine_var, ["local", "elevenlabs", "voice-changer"])
     field(2, 0, "Cloud voice ID", voice_var)
     field(2, 2, "Cloud model", cloud_model_var)
     field(3, 0, "Voice speed", speed_var)
@@ -1030,6 +1046,31 @@ def run_control_ui(config: AppConfig):
         style="Muted.TLabel",
         wraplength=780,
     ).grid(row=5, column=0, columnspan=4, sticky="w", pady=8)
+    field(6, 0, "Live server URL", vc_url_var)
+    field(6, 2, "Live block size", vc_block_var, ["2048", "4096", "8192", "16384"])
+    ttk.Label(ai_tab, text="Live calls: choose voice-changer + Live mode, a physical microphone, and a virtual-cable output.\nLoad your voice model in the upstream server first. Use headphones for call audio.",
+              wraplength=780, style="Muted.TLabel").grid(row=7, column=0, columnspan=4, sticky="w", pady=8)
+
+    def check_live_server():
+        from voice_changer_engine import LiveConfig, VoiceChangerClient
+        try:
+            live = LiveConfig(vc_url_var.get().strip(), block_size=int(vc_block_var.get()))
+        except ValueError as exc:
+            messagebox.showerror("Check server settings", str(exc), parent=root)
+            return
+        def check(stop):
+            client = VoiceChangerClient(live)
+            try:
+                info = client.check()
+                client.convert(bytes(live.block_size * 2))
+                status_bus.emit(f"Live server inference ready: model slot {info['modelSlotIndex']}")
+            finally:
+                client.close()
+        run_tool("Checking live server", check)
+
+    live_check = ttk.Button(ai_tab, text="Check live server & model", command=check_live_server)
+    live_check.grid(row=8, column=0, columnspan=4, sticky="w")
+    settings_widgets.append(live_check)
     ttk.Label(tools_tab, text="LOCAL AUDIO TOOLS", style="Muted.TLabel").pack(
         anchor="w", pady=(0, 10)
     )
@@ -1120,10 +1161,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Real-time voice cloning for live calls.")
     parser.add_argument(
         "--engine",
-        choices=["local", "elevenlabs"],
+        choices=["local", "elevenlabs", "voice-changer"],
         default="local",
-        help="Choose local XTTS or ElevenLabs cloning.",
+        help="Choose XTTS, ElevenLabs, or continuous w-okada voice conversion.",
     )
+    parser.add_argument("--vc-url", default="http://127.0.0.1:18888", help="Local w-okada source-compatible server URL")
+    parser.add_argument("--vc-block-size", type=int, choices=[2048, 4096, 8192, 16384], default=8192)
+    parser.add_argument("--vc-check", action="store_true", help="Check live server and model without microphone capture")
     parser.add_argument("--speaker-wav", help="Path to speaker WAV for cloning.")
     parser.add_argument(
         "--record-speaker",
@@ -1272,6 +1316,17 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.vc_check:
+        from voice_changer_engine import LiveConfig, VoiceChangerClient
+        live = LiveConfig(args.vc_url, block_size=args.vc_block_size)
+        client = VoiceChangerClient(live)
+        try:
+            info = client.check()
+            client.convert(bytes(live.block_size * 2))
+            print(json.dumps({"ready": True, "modelSlotIndex": info["modelSlotIndex"], "sampleRate": live.sample_rate}))
+        finally:
+            client.close()
+        return 0
     if args.self_check:
         report = render_report(run_self_check(args.engine, args.run_mode, args.stt_backend))
         if args.diagnostics_output:
@@ -1300,6 +1355,20 @@ def main():
 
         print(json.dumps(asdict(analyze_speaker_wav(args.inspect_reference)), indent=2))
         return 0
+    if args.engine == "voice-changer" and args.run_mode == "live" and not args.ui and not args.input_file:
+        from voice_changer_engine import start_live_threads
+        stop, recorder, processor = start_live_threads(args, StatusBus())
+        print("Live conversion · Ctrl+C to stop")
+        try:
+            while not stop.wait(0.2):
+                pass
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop.set()
+            recorder.join()
+            processor.join()
+        return 1 if stop.failed else 0
     load_runtime()
     apply_torch_performance_settings()
     if args.performance_mode == "cpu" or args.force_cpu:
@@ -1384,7 +1453,7 @@ def main():
                 raise ValueError(
                     "Provide --speaker-wav or --record-speaker, or use --ui to load a reference."
                 )
-        else:
+        elif args.engine == "elevenlabs":
             get_api_key()
             if not elevenlabs_voice_id:
                 if not speaker_wav:
@@ -1400,7 +1469,7 @@ def main():
                     ).voice_id
                 finally:
                     engine.close()
-    if not args.ui:
+    if not args.ui and args.engine != "voice-changer":
         silence_threshold = calibrate_silence_threshold(device_index=device_index)
 
     print("For Linux: Ensure virtual mic is set up with PulseAudio.")
@@ -1428,6 +1497,8 @@ def main():
         playback_device=args.playback_device,
         playback_block_size=args.playback_block_size,
         engine=args.engine,
+        vc_url=args.vc_url,
+        vc_block_size=args.vc_block_size,
         elevenlabs_voice_id=elevenlabs_voice_id,
         force_cpu=force_cpu,
         auto_language=args.auto_language,

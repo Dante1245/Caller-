@@ -74,3 +74,12 @@ This section supersedes the earlier UI-binding limitation and test count above.
 The project still has no generative conversation-assistant service. Summaries and
 candidate actions are explicitly labeled extractive English heuristics. Model
 weights, capabilities, accounts and hardware impose limits that tests cannot remove.
+
+## w-okada continuous voice conversion integration
+
+- Inspected upstream source at `f1caf8e7c39fd0d6866202be27bf142790191a51`; implemented its `/info` and `/test` PCM protocol without copying the inference stack.
+- 67 regression tests passed, including 18 live-bridge cases: actual local HTTP exchange, malformed frames/timestamps, model/sample-rate readiness, pass-through/server-audio rejection, bounded buffering, mute and stream cleanup.
+- Exchanged an 8192-sample block through the **actual upstream FastAPI route** with a deterministic fake inference manager; output matched exactly. This proves serialization/transport compatibility, not RVC inference.
+- Native macOS studio displayed new engine, URL, block-size and check controls. Missing-server check visibly reported connection refused and restored controls without capturing audio.
+- Local live dependencies and physical input/BlackHole output enumerate successfully. No system audio defaults changed.
+- No compatible inference server/model is running at `127.0.0.1:18888`. RVC voice similarity, inference latency, virtual-cable end-to-end output and real calls remain unverified. Current VCClient v2 binaries have not been tested; this integration targets the documented source API.

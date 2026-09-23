@@ -55,15 +55,18 @@ def run_self_check(engine="local", run_mode="live", stt_backend="whisper"):
         "soundfile",
         "sounddevice",
     ]
-    if run_mode == "live":
+    if engine == "voice-changer" and run_mode == "live":
+        modules = ["numpy", "sounddevice"]
+    elif run_mode == "live":
         modules.append("TTS.api" if engine == "local" else "elevenlabs")
     results = [CheckResult("python", (3, 10) <= sys.version_info[:2] < (3, 14), sys.version)]
     results += [_check(m, lambda m=m: importlib.import_module(m).__name__) for m in modules]
-    results.append(
-        CheckResult(
-            "ffmpeg", shutil.which("ffmpeg") is not None, shutil.which("ffmpeg") or "Install ffmpeg"
+    if engine != "voice-changer" or run_mode != "live":
+        results.append(
+            CheckResult(
+                "ffmpeg", shutil.which("ffmpeg") is not None, shutil.which("ffmpeg") or "Install ffmpeg"
+            )
         )
-    )
     results.append(_check("audio.inputs", lambda: _audio("inputs")))
     if run_mode == "live":
         results.append(_check("audio.outputs", lambda: _audio("outputs")))
