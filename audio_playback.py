@@ -27,9 +27,18 @@ class PlaybackEngine:
             blocksize=self.config.block_size,
             device=self.config.device,
         )
-        self.stream.start()
+        try:
+            self.stream.start()
+        except Exception:
+            self.stream.close()
+            self.stream = None
+            raise
 
     def play(self, audio: np.ndarray) -> None:
+        if audio.size == 0:
+            return
+        if not np.isfinite(audio).all():
+            raise ValueError("Playback audio contains non-finite values")
         if not self.stream:
             self.start()
         if audio.ndim > 1:
@@ -39,6 +48,8 @@ class PlaybackEngine:
     def stop(self) -> None:
         if not self.stream:
             return
-        self.stream.stop()
-        self.stream.close()
-        self.stream = None
+        stream, self.stream = self.stream, None
+        try:
+            stream.stop()
+        finally:
+            stream.close()

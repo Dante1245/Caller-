@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
+from storage import read_object, write_object
 
 
 REPORT_PATH = Path("usage_report.json")
@@ -20,15 +20,11 @@ class UsageReport:
 
 
 def load_report() -> dict[str, Any]:
-    if not REPORT_PATH.exists():
-        return {}
-    with REPORT_PATH.open("r") as handle:
-        return json.load(handle)
+    return read_object(REPORT_PATH)
 
 
 def save_report(report: UsageReport) -> None:
-    with REPORT_PATH.open("w") as handle:
-        json.dump(asdict(report), handle, indent=2)
+    write_object(REPORT_PATH, asdict(report))
 
 
 def update_report(
@@ -39,9 +35,7 @@ def update_report(
 ) -> UsageReport:
     report.sessions = max(report.sessions, 1)
     report.utterances += 1
-    report.avg_latency_ms = _running_average(
-        report.avg_latency_ms, latency_ms, report.utterances
-    )
+    report.avg_latency_ms = _running_average(report.avg_latency_ms, latency_ms, report.utterances)
     report.avg_word_count = _running_average(
         report.avg_word_count, float(word_count), report.utterances
     )
@@ -63,9 +57,7 @@ def generate_recommendations(report: UsageReport) -> list[str]:
             "Latency is high. Try --model base, disable noise reduction, or use a GPU."
         )
     if report.avg_word_count < 3:
-        recommendations.append(
-            "Short utterances detected. Consider lowering --min-buffer-chunks."
-        )
+        recommendations.append("Short utterances detected. Consider lowering --min-buffer-chunks.")
     if report.avg_word_count > 18:
         recommendations.append(
             "Long utterances detected. Consider raising --min-buffer-chunks for stability."

@@ -1,10 +1,8 @@
-openai-whisper
-pyaudio
-noisereduce
-torch
-vaderSentiment
-TTS
-sounddevice
-soundfile
-elevenlabs
-vaderSentiment
+# Shared runtime. Python 3.10–3.13; use 3.12 for a new environment.
+numpy>=1.26,<3
+openai-whisper>=20240930
+noisereduce>=3,<4
+torch>=2.2,<3
+vaderSentiment>=3.3.2,<4
+sounddevice>=0.5,<0.6
+soundfile>=0.13,<0.15

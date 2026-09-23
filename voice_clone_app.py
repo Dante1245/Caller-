@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 import argparse
 import json
-import os
 import queue
 import threading
 import time
 import wave
-from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tts_engine import LocalTTS
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-import numpy as np
-import pyaudio
-import torch
-import whisper
-import noisereduce as nr
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+# Runtime dependencies are loaded only after CLI validation and diagnostics.
+from audio_capture import UtteranceBuffer, pcm_rms
 
-from audio_playback import PlaybackConfig, PlaybackEngine
 from conversation_ai import compute_speaking_rate_wpm, infer_intent, suggest_response_style
 from elevenlabs_engine import ElevenLabsConfig, ElevenLabsEngine, get_api_key
-from tts_engine import LocalTTS
-from voice_profile import analyze_speaker_wav, normalize_speaker_wav, save_profile, VoiceProfile
 from usage_analytics import (
     UsageReport,
     load_report,
@@ -35,25 +32,28 @@ from performance_tuning import (
 )
 from quality_ai import assess_call_quality
 from self_check import render_report, run_self_check
-"""
-Ultra-low-latency, sentiment-aware voice cloning pipeline.
 
-Updates in this version:
-- Mood tracking via VADER sentiment for richer analytics per utterance.
-- Per-word timestamps from Whisper for detailed call analytics and responsive UX.
-- GPU-aware Whisper loading and tuned silence detection for faster turn-taking.
-- Local ultra-fast voice cloning via Coqui XTTS v2 (no external API).
-"""
 
-sentiment_analyzer = SentimentIntensityAnalyzer()
+def load_runtime():
+    global np, sd, torch, whisper, nr, sentiment_analyzer
+    global PlaybackConfig, PlaybackEngine, VoiceProfile
+    global analyze_speaker_wav, normalize_speaker_wav, save_profile
+    import numpy as np
+    import sounddevice as sd
+    import torch
+    import whisper
+    import noisereduce as nr
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    from audio_playback import PlaybackConfig, PlaybackEngine
+    from voice_profile import analyze_speaker_wav, normalize_speaker_wav, save_profile, VoiceProfile
+
+    sentiment_analyzer = SentimentIntensityAnalyzer()
+
 
 # Audio constants for predictable, low-latency behavior
-SAMPLE_FORMAT = pyaudio.paInt16
 CHANNELS = 1
 SAMPLE_RATE = 16000
 CHUNK = 1024
-SILENCE_CHUNKS = 8  # shorter silence window for snappier responses
-MIN_BUFFER_CHUNKS = 40  # lower minimum to ship faster to Whisper
 TRANSCRIPTS_PATH = Path("transcripts.txt")
 
 
@@ -79,15 +79,19 @@ class AppConfig:
     force_cpu: bool
     auto_language: bool
     run_mode: str
+    log_transcripts: bool = False
 
 
 class StatusBus:
     def __init__(self) -> None:
-        self.queue: queue.Queue[str] = queue.Queue()
+        self.queue: queue.Queue[str] = queue.Queue(maxsize=500)
 
     def emit(self, message: str) -> None:
         print(message)
-        self.queue.put(message)
+        try:
+            self.queue.put_nowait(message)
+        except queue.Full:
+            pass
 
 
 class AdaptiveGain:
@@ -113,44 +117,38 @@ def trim_silence(audio: np.ndarray, threshold: float = 0.01) -> np.ndarray:
     end = int(len(mask) - np.argmax(mask[::-1]))
     return audio[start:end]
 
+
 def record_sample(duration=5, filename=None, device_index=None):
     """Capture a short, high-fidelity sample for cloning."""
     if not filename:
         filename = f"sample_{time.time()}.wav"
 
-    pa = pyaudio.PyAudio()
-    print("Recording sample...")
-    stream = pa.open(
-        format=SAMPLE_FORMAT,
-        channels=CHANNELS,
-        rate=SAMPLE_RATE,
-        frames_per_buffer=CHUNK,
-        input=True,
-        input_device_index=device_index,
-    )
-    frames = []
-    for _ in range(0, int(SAMPLE_RATE / CHUNK * duration)):
-        data = stream.read(CHUNK, exception_on_overflow=False)
-        frames.append(data)
-    stream.stop_stream()
-    stream.close()
-    sample_width = pa.get_sample_size(SAMPLE_FORMAT)
-    pa.terminate()
-
-    wf = wave.open(filename, "wb")
-    wf.setnchannels(CHANNELS)
-    wf.setsampwidth(sample_width)
-    wf.setframerate(SAMPLE_RATE)
-    wf.writeframes(b"".join(frames))
-    wf.close()
+    frames = capture_frames(duration, device_index)
+    with wave.open(filename, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(b"".join(frames))
     print("Sample recorded.")
     return filename
 
+
+def capture_frames(seconds, device_index=None):
+    with sd.RawInputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype="int16",
+        blocksize=CHUNK,
+        device=device_index,
+    ) as stream:
+        return [
+            bytes(stream.read(CHUNK)[0]) for _ in range(max(1, int(SAMPLE_RATE / CHUNK * seconds)))
+        ]
+
+
 def is_silent(data, threshold=500):
     """Check if audio data is silent based on RMS."""
-    audio_data = np.frombuffer(data, dtype=np.int16)
-    rms = np.sqrt(np.mean(audio_data ** 2))
-    return rms < threshold
+    return pcm_rms(data) < threshold
 
 
 def get_device_and_model(model_name=None, force_cpu=False):
@@ -212,73 +210,51 @@ def extract_word_timestamps(result):
 
 def calibrate_silence_threshold(device_index=None, seconds=1.5):
     """Calibrate silence threshold based on ambient noise."""
-    pa = pyaudio.PyAudio()
-    stream = pa.open(
-        format=SAMPLE_FORMAT,
-        channels=CHANNELS,
-        rate=SAMPLE_RATE,
-        frames_per_buffer=CHUNK,
-        input=True,
-        input_device_index=device_index,
-    )
-    frames = []
-    for _ in range(0, int(SAMPLE_RATE / CHUNK * seconds)):
-        frames.append(stream.read(CHUNK, exception_on_overflow=False))
-    stream.stop_stream()
-    stream.close()
-    pa.terminate()
-    audio_data = np.frombuffer(b"".join(frames), dtype=np.int16)
-    if audio_data.size == 0:
-        return 500
-    rms = float(np.sqrt(np.mean(audio_data ** 2)))
+    frames = capture_frames(seconds, device_index)
+    rms = pcm_rms(b"".join(frames))
     return max(200, int(rms * 1.8))
+
 
 def real_time_record(audio_queue, stop_event, config: AppConfig, status_bus: StatusBus):
     """Continuously record audio, detect silence, and enqueue denoised clips."""
-    pa = pyaudio.PyAudio()
-    stream = pa.open(
-        format=SAMPLE_FORMAT,
-        channels=CHANNELS,
-        rate=SAMPLE_RATE,
-        frames_per_buffer=CHUNK,
-        input=True,
-        input_device_index=config.device_index,
+    segmenter = UtteranceBuffer(
+        config.silence_threshold, config.silence_chunks, config.min_buffer_chunks, max_chunks=469
     )
-    status_bus.emit("Listening continuously... Speak and pause to process.")
-    buffer = []
-    silence_count = 0
-    while not stop_event.is_set():
-        data = stream.read(CHUNK, exception_on_overflow=False)
-        buffer.append(data)
-        if is_silent(data, threshold=config.silence_threshold):
-            silence_count += 1
-        else:
-            silence_count = 0
-        if silence_count > config.silence_chunks and len(buffer) > config.min_buffer_chunks:
-            audio_data = b"".join(buffer)
-            audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+    with sd.RawInputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype="int16",
+        blocksize=CHUNK,
+        device=config.device_index,
+    ) as stream:
+        status_bus.emit("Listening. Speak and pause to process.")
+        while not stop_event.is_set():
+            data, overflowed = stream.read(CHUNK)
+            if overflowed:
+                status_bus.emit("Microphone overflow: some input samples were lost.")
+            clip = segmenter.feed(bytes(data))
+            if clip is None:
+                continue
+            audio = np.frombuffer(clip, dtype=np.int16).astype(np.float32) / 32768.0
             if config.use_noise_reduction:
-                reduced_noise = nr.reduce_noise(y=audio_np, sr=SAMPLE_RATE)
-            else:
-                reduced_noise = audio_np
-            filename = f"temp_{time.time()}.wav"
-            wf = wave.open(filename, "wb")
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes((reduced_noise.astype(np.int16)).tobytes())
-            wf.close()
-            audio_queue.put(filename)
-            buffer = []
-            silence_count = 0
-    stream.stop_stream()
-    stream.close()
-    pa.terminate()
+                audio = nr.reduce_noise(y=audio, sr=SAMPLE_RATE)
+            try:
+                audio_queue.put_nowait(audio)
+            except queue.Full:
+                status_bus.emit("Processing is behind; dropped a new clip. Try a smaller model.")
 
 
-def log_transcript(text, mood, compound, word_timings, intent="general", speaking_rate_wpm=0.0, detected_language="en"):
+def log_transcript(
+    text,
+    mood,
+    compound,
+    word_timings,
+    intent="general",
+    speaking_rate_wpm=0.0,
+    detected_language="en",
+):
     timestamp = time.ctime()
-    with TRANSCRIPTS_PATH.open("a") as f:
+    with TRANSCRIPTS_PATH.open("a", encoding="utf-8") as f:
         f.write(
             f"{timestamp} | mood={mood} ({compound:.3f}) | "
             f"intent={intent} | wpm={speaking_rate_wpm:.1f} | lang={detected_language} | text={text}\n"
@@ -302,8 +278,14 @@ def process_audio(audio_queue, stop_event, config: AppConfig, status_bus: Status
     gain_controller = None
     playback = None
     elevenlabs_engine = None
-    if config.engine == "local":
-        tts_engine = LocalTTS(model_name=config.tts_model, device="cpu" if config.force_cpu else None)
+    if config.run_mode == "test":
+        pass
+    elif config.engine == "local":
+        from tts_engine import LocalTTS
+
+        tts_engine = LocalTTS(
+            model_name=config.tts_model, device="cpu" if config.force_cpu else None
+        )
         gain_controller = AdaptiveGain(config.playback_gain)
         playback = PlaybackEngine(
             PlaybackConfig(
@@ -314,92 +296,120 @@ def process_audio(audio_queue, stop_event, config: AppConfig, status_bus: Status
         )
     else:
         elevenlabs_engine = ElevenLabsEngine(
-            ElevenLabsConfig(api_key=get_api_key(), voice_id=config.elevenlabs_voice_id)
+            ElevenLabsConfig(
+                api_key=get_api_key(),
+                voice_id=config.elevenlabs_voice_id,
+                device=config.playback_device,
+                block_size=config.playback_block_size,
+            )
         )
-    report_data = load_report()
-    report = UsageReport(**report_data) if report_data else UsageReport()
-    report = start_session(report, config.profile_name)
-    while not stop_event.is_set():
-        audio_file = None
-        try:
-            start_time = time.perf_counter()
-            audio_file = audio_queue.get(timeout=1)
-            transcription_language = None if config.auto_language else config.language
-            result = model.transcribe(
-                audio_file,
-                language=transcription_language,
-                word_timestamps=True,
-                fp16=torch.cuda.is_available() and not config.force_cpu,
-                temperature=0.0,
-                best_of=1,
-                beam_size=1,
-            )
-            text = result.get("text", "").strip()
-            if not text:
-                continue
-            detected_language = result.get("language", config.language)
-            mood, compound = analyze_mood(text)
-            word_timings = extract_word_timestamps(result)
-            intent = infer_intent(text)
-            utterance_duration = None
-            if word_timings:
-                first_start = word_timings[0].get("start")
-                last_end = word_timings[-1].get("end")
-                if first_start is not None and last_end is not None and last_end > first_start:
-                    utterance_duration = float(last_end - first_start)
-            speaking_rate_wpm = compute_speaking_rate_wpm(text, utterance_duration)
-            style_hint = suggest_response_style(mood, intent, speaking_rate_wpm)
-            status_bus.emit(f"You said: {text}")
-            status_bus.emit(f"Mood detected: {mood} (compound={compound:.3f})")
-            status_bus.emit(
-                f"Detected intent={intent}, language={detected_language}, "
-                f"pace={speaking_rate_wpm:.1f} wpm, style={style_hint}"
-            )
-            if word_timings:
-                status_bus.emit("Word timings:")
-                for word in word_timings:
+    try:
+        report_data = load_report()
+        report = UsageReport(**report_data) if report_data else UsageReport()
+        report = start_session(report, config.profile_name)
+        ready_event = getattr(stop_event, "ready", None)
+        if ready_event is not None:
+            ready_event.set()
+        while not stop_event.is_set():
+            audio_file = None
+            try:
+                audio_file = audio_queue.get(timeout=0.2)
+                start_time = time.perf_counter()
+                if stop_event.is_set():
+                    break
+                transcription_language = None if config.auto_language else config.language
+                result = model.transcribe(
+                    audio_file,
+                    language=transcription_language,
+                    word_timestamps=True,
+                    fp16=torch.cuda.is_available() and not config.force_cpu,
+                    temperature=0.0,
+                    best_of=1,
+                    beam_size=1,
+                )
+                text = result.get("text", "").strip()
+                if not text:
+                    continue
+                detected_language = result.get("language", config.language)
+                mood, compound = analyze_mood(text)
+                word_timings = extract_word_timestamps(result)
+                intent = infer_intent(text)
+                utterance_duration = None
+                if word_timings:
+                    first_start = word_timings[0].get("start")
+                    last_end = word_timings[-1].get("end")
+                    if first_start is not None and last_end is not None and last_end > first_start:
+                        utterance_duration = float(last_end - first_start)
+                speaking_rate_wpm = compute_speaking_rate_wpm(text, utterance_duration)
+                style_hint = suggest_response_style(mood, intent, speaking_rate_wpm)
+                status_bus.emit(f"You said: {text}")
+                status_bus.emit(f"Mood detected: {mood} (compound={compound:.3f})")
+                status_bus.emit(
+                    f"Detected intent={intent}, language={detected_language}, "
+                    f"pace={speaking_rate_wpm:.1f} wpm, style={style_hint}"
+                )
+                if word_timings:
+                    status_bus.emit("Word timings:")
+                    for word in word_timings:
+                        status_bus.emit(
+                            f"  {word['word']} :: {(word['start'] or 0):.2f}s -> {(word['end'] or 0):.2f}s"
+                        )
+                if stop_event.is_set():
+                    break
+                if config.run_mode == "test":
                     status_bus.emit(
-                        f"  {word['word']} :: {word['start']:.2f}s -> {word['end']:.2f}s"
+                        "TEST mode: transcription and analytics complete; voice playback skipped."
                     )
-            if config.run_mode == "test":
-                status_bus.emit("TEST mode: transcription and analytics complete; voice playback skipped.")
-            elif config.engine == "local":
-                text_to_cloned_voice(text, config, tts_engine, gain_controller, playback, mood)
-            else:
-                text_to_elevenlabs_voice(text, elevenlabs_engine, mood)
-            latency_ms = (time.perf_counter() - start_time) * 1000
-            status_bus.emit(f"End-to-end latency: {latency_ms:.1f} ms")
-            quality = assess_call_quality(
-                latency_ms=latency_ms,
-                speaking_rate_wpm=speaking_rate_wpm,
-                mood=mood,
-                has_word_timestamps=bool(word_timings),
-            )
-            status_bus.emit(
-                f"Quality score: {quality.score:.1f}/100 ({quality.label}) | tip: {quality.recommendation}"
-            )
-            report = update_report(report, latency_ms, len(text.split()), config.profile_name)
-            save_report(report)
-            if config.auto_upgrade and report.recommendations:
-                status_bus.emit("Auto-upgrade hints:")
-                for recommendation in report.recommendations:
-                    status_bus.emit(f"  - {recommendation}")
-            log_transcript(
-                text,
-                mood,
-                compound,
-                word_timings,
-                intent=intent,
-                speaking_rate_wpm=speaking_rate_wpm,
-                detected_language=detected_language,
-            )
-        except queue.Empty:
-            continue
-        finally:
-            if audio_file and os.path.exists(audio_file):
-                os.remove(audio_file)
-    if playback:
-        playback.stop()
+                elif config.engine == "local":
+                    text_to_cloned_voice(
+                        text,
+                        replace(config, language=detected_language)
+                        if config.auto_language
+                        else config,
+                        tts_engine,
+                        gain_controller,
+                        playback,
+                        mood,
+                    )
+                else:
+                    text_to_elevenlabs_voice(text, elevenlabs_engine, mood)
+                latency_ms = (time.perf_counter() - start_time) * 1000
+                status_bus.emit(f"Processing + playback latency: {latency_ms:.1f} ms")
+                quality = assess_call_quality(
+                    latency_ms=latency_ms,
+                    speaking_rate_wpm=speaking_rate_wpm,
+                    mood=mood,
+                    has_word_timestamps=bool(word_timings),
+                )
+                status_bus.emit(
+                    f"Quality score: {quality.score:.1f}/100 ({quality.label}) | tip: {quality.recommendation}"
+                )
+                report = update_report(report, latency_ms, len(text.split()), config.profile_name)
+                save_report(report)
+                if config.auto_upgrade and report.recommendations:
+                    status_bus.emit("Auto-upgrade hints:")
+                    for recommendation in report.recommendations:
+                        status_bus.emit(f"  - {recommendation}")
+                if config.log_transcripts:
+                    log_transcript(
+                        text,
+                        mood,
+                        compound,
+                        word_timings,
+                        intent=intent,
+                        speaking_rate_wpm=speaking_rate_wpm,
+                        detected_language=detected_language,
+                    )
+            except queue.Empty:
+                continue
+            finally:
+                if audio_file is not None:
+                    audio_queue.task_done()
+    finally:
+        if playback:
+            playback.stop()
+        if elevenlabs_engine:
+            elevenlabs_engine.close()
 
 
 def text_to_cloned_voice(
@@ -411,9 +421,8 @@ def text_to_cloned_voice(
     mood="neutral",
 ):
     """Synthesize and play cloned voice using local XTTS."""
-    annotated_text = f"{mood_preamble(mood)} {text}"
     result = tts_engine.synthesize(
-        text=annotated_text,
+        text=text,
         speaker_wav=config.speaker_wav,
         language=config.language,
     )
@@ -427,19 +436,13 @@ def text_to_cloned_voice(
 
 
 def text_to_elevenlabs_voice(text: str, engine: ElevenLabsEngine, mood: str) -> None:
-    annotated_text = f"{mood_preamble(mood)} {text}"
-    engine.synthesize(annotated_text, mood)
+    engine.synthesize(text, mood)
 
 
 def list_input_devices():
-    pa = pyaudio.PyAudio()
-    devices = []
-    for i in range(pa.get_device_count()):
-        info = pa.get_device_info_by_index(i)
-        if info.get("maxInputChannels", 0) > 0:
-            devices.append((i, info.get("name", f"Device {i}")))
-    pa.terminate()
-    return devices
+    from self_check import list_devices
+
+    return [(d["index"], d["name"]) for d in list_devices()["inputs"]]
 
 
 def resolve_device_index(requested):
@@ -452,152 +455,262 @@ def resolve_device_index(requested):
 
 
 def start_threads(config: AppConfig, status_bus: StatusBus):
-    audio_queue = queue.Queue()
+    audio_queue = queue.Queue(maxsize=3)
     stop_event = threading.Event()
-    record_thread = threading.Thread(
-        target=real_time_record, args=(audio_queue, stop_event, config, status_bus)
-    )
-    process_thread = threading.Thread(
-        target=process_audio, args=(audio_queue, stop_event, config, status_bus)
-    )
-    record_thread.start()
+    stop_event.ready = threading.Event()
+    stop_event.failed = False
+
+    def guarded(target):
+        try:
+            if target is real_time_record:
+                while not stop_event.ready.wait(0.1):
+                    if stop_event.is_set():
+                        return
+                if stop_event.is_set():
+                    return
+            target(audio_queue, stop_event, config, status_bus)
+        except Exception as exc:
+            stop_event.failed = True
+            status_bus.emit(f"Pipeline stopped: {type(exc).__name__}: {exc}")
+            stop_event.set()
+
+    record_thread = threading.Thread(target=guarded, args=(real_time_record,), daemon=True)
+    process_thread = threading.Thread(target=guarded, args=(process_audio,), daemon=True)
     process_thread.start()
+    record_thread.start()
     return stop_event, record_thread, process_thread
 
 
 def run_control_ui(config: AppConfig):
     import tkinter as tk
-    from tkinter import filedialog, messagebox
-
-    status_bus = StatusBus()
-    app_state = {"running": False, "stop_event": None, "threads": None}
-    speaker_var = tk.StringVar(value=config.speaker_wav or "No file loaded")
-    analysis_var = tk.StringVar(value="Voice analysis: not loaded")
-    mode_var = tk.StringVar(value=config.run_mode)
-
-    def apply_voice_file(path: str):
-        if not path or not os.path.exists(path):
-            messagebox.showerror("Invalid file", "Please choose a valid voice audio file.")
-            return
-        if config.engine == "local":
-            profile = analyze_speaker_wav(path)
-            normalized_path = normalize_speaker_wav(path, profile, config.profile_name)
-            save_profile(config.profile_name, profile)
-            config.speaker_wav = normalized_path
-            config.playback_gain = profile.gain
-            config.silence_threshold = max(config.silence_threshold, profile.silence_threshold)
-            speaker_var.set(normalized_path)
-            analysis_var.set(
-                "Voice analysis: "
-                f"gain={profile.gain:.2f}, silence_threshold={profile.silence_threshold}, "
-                f"duration={profile.duration_s:.1f}s"
-            )
-            status_bus.emit(f"Loaded and analyzed voice file: {normalized_path}")
-        else:
-            config.speaker_wav = path
-            speaker_var.set(path)
-            analysis_var.set("Voice analysis: loaded for ElevenLabs clone flow")
-            status_bus.emit(f"Loaded voice file for ElevenLabs mode: {path}")
-
-    def browse_voice_file():
-        selected = filedialog.askopenfilename(
-            title="Select voice sample",
-            filetypes=[("Audio files", "*.wav *.mp3 *.m4a *.flac"), ("All files", "*.*")],
-        )
-        if selected:
-            apply_voice_file(selected)
-
-    def start_app():
-        if app_state["running"]:
-            return
-        config.run_mode = mode_var.get()
-        if config.engine == "local" and (not config.speaker_wav or not os.path.exists(config.speaker_wav)):
-            messagebox.showwarning(
-                "Voice file required",
-                "Load a voice file before starting the local cloning pipeline.",
-            )
-            return
-        status_bus.emit(f"Starting {config.run_mode.upper()} pipeline...")
-        stop_event, record_thread, process_thread = start_threads(config, status_bus)
-        app_state.update(
-            {
-                "running": True,
-                "stop_event": stop_event,
-                "threads": (record_thread, process_thread),
-            }
-        )
-
-    def stop_app():
-        if not app_state["running"]:
-            return
-        status_bus.emit("Stopping pipeline...")
-        app_state["stop_event"].set()
-        for thread in app_state["threads"]:
-            thread.join()
-        app_state.update({"running": False, "stop_event": None, "threads": None})
-        status_bus.emit("Stopped.")
-
-    def poll_status():
-        while not status_bus.queue.empty():
-            message = status_bus.queue.get_nowait()
-            log.insert(tk.END, message + "\n")
-            log.see(tk.END)
-        root.after(200, poll_status)
+    from tkinter import filedialog, messagebox, ttk
+    from self_check import list_devices
 
     root = tk.Tk()
-    root.title("Live Voice Clone Control")
-    root.geometry("560x380")
-
-    header = tk.Label(root, text="Live Voice Clone Control", font=("Arial", 14, "bold"))
-    header.pack(pady=6)
-
-    status_frame = tk.Frame(root)
-    status_frame.pack(fill=tk.X, padx=10)
-    tk.Label(status_frame, text="Speaker WAV:").pack(anchor="w")
-    tk.Label(status_frame, textvariable=speaker_var, wraplength=520, justify="left").pack(anchor="w")
-    tk.Label(status_frame, text=f"TTS model: {config.tts_model}").pack(anchor="w")
-    tk.Label(status_frame, text=f"Whisper model: {config.model_name}").pack(anchor="w")
-    tk.Label(status_frame, text=f"Profile: {config.profile_name}").pack(anchor="w")
-    tk.Label(status_frame, text=f"Performance: {config.performance_mode}").pack(anchor="w")
-    tk.Label(status_frame, text=f"Engine: {config.engine}").pack(anchor="w")
-    tk.Label(
-        status_frame,
-        text=f"Auto-upgrade hints: {'On' if config.auto_upgrade else 'Off'}",
-    ).pack(anchor="w")
-    tk.Label(
-        status_frame,
-        text=f"Noise reduction: {'On' if config.use_noise_reduction else 'Off'}",
-    ).pack(anchor="w")
-    tk.Label(status_frame, textvariable=analysis_var, wraplength=520, justify="left").pack(anchor="w")
-
-    controls = tk.Frame(root)
-    controls.pack(pady=8)
-    mode_controls = tk.Frame(root)
-    mode_controls.pack(pady=2)
-    tk.Label(mode_controls, text="Run mode:").pack(side=tk.LEFT, padx=4)
-    tk.Radiobutton(mode_controls, text="Live", variable=mode_var, value="live").pack(
-        side=tk.LEFT, padx=4
+    root.title("Caller · Voice studio")
+    root.geometry("820x700")
+    root.minsize(700, 620)
+    root.configure(background="#f3f5f7")
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    style.configure("TFrame", background="#f3f5f7")
+    style.configure("TLabel", background="#f3f5f7", foreground="#172a3a", font=("Helvetica", 12))
+    style.configure("Title.TLabel", font=("Helvetica", 27, "bold"))
+    style.configure("Muted.TLabel", foreground="#536575")
+    style.configure("TButton", padding=(14, 9), font=("Helvetica", 11))
+    style.configure("Accent.TButton", background="#176c60", foreground="white")
+    style.configure("TRadiobutton", background="#f3f5f7", font=("Helvetica", 11))
+    status_bus = StatusBus()
+    state = {"threads": (), "stop": None, "closing": False}
+    speaker_var = tk.StringVar(
+        root, value=config.speaker_wav or "Choose a reference voice for local playback"
     )
-    tk.Radiobutton(mode_controls, text="Test", variable=mode_var, value="test").pack(
-        side=tk.LEFT, padx=4
-    )
-    tk.Button(controls, text="Load Voice File", width=14, command=browse_voice_file).pack(
-        side=tk.LEFT, padx=6
-    )
-    tk.Button(controls, text="Start", width=12, command=start_app).pack(
-        side=tk.LEFT, padx=6
-    )
-    tk.Button(controls, text="Stop", width=12, command=stop_app).pack(
-        side=tk.LEFT, padx=6
-    )
+    detail_var = tk.StringVar(root, value="Transcription-only mode works without a voice sample.")
+    mode_var = tk.StringVar(root, value=config.run_mode)
+    status_var = tk.StringVar(root, value="Ready")
+    input_var = tk.StringVar(root, value="System default")
+    output_var = tk.StringVar(root, value="System default")
+    inputs, outputs = {"System default": None}, {"System default": None}
 
-    log = tk.Text(root, height=12)
-    log.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+    def busy():
+        return any(t.is_alive() for t in state["threads"])
 
-    root.after(200, poll_status)
+    def refresh_devices():
+        try:
+            devices = list_devices()
+            inputs.clear()
+            inputs["System default"] = None
+            outputs.clear()
+            outputs["System default"] = None
+            inputs.update({f"{d['index']} · {d['name']}": d["index"] for d in devices["inputs"]})
+            outputs.update({f"{d['index']} · {d['name']}": d["index"] for d in devices["outputs"]})
+            for widget, variable, options, selected in (
+                (input_box, input_var, inputs, config.device_index),
+                (output_box, output_var, outputs, config.playback_device),
+            ):
+                widget.configure(values=list(options))
+                variable.set(
+                    next((k for k, v in options.items() if v == selected), "System default")
+                )
+        except Exception as exc:
+            status_bus.emit(f"Audio devices unavailable: {exc}")
+
+    def browse_voice():
+        path = filedialog.askopenfilename(
+            parent=root,
+            title="Choose a reference voice",
+            filetypes=[("Audio", "*.wav *.flac *.mp3"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            profile = analyze_speaker_wav(path)
+            config.speaker_wav = normalize_speaker_wav(path, profile, config.profile_name)
+            save_profile(config.profile_name, profile)
+            config.playback_gain = profile.gain
+            speaker_var.set(config.speaker_wav)
+            detail_var.set(
+                f"{profile.duration_s:.1f} seconds · {profile.sample_rate:,} Hz · gain {profile.gain:.2f}"
+            )
+        except Exception as exc:
+            messagebox.showerror("Could not load reference", str(exc), parent=root)
+
+    def start_app():
+        if busy():
+            return
+        run_config = replace(
+            config,
+            run_mode=mode_var.get(),
+            device_index=inputs[input_var.get()],
+            playback_device=outputs[output_var.get()],
+        )
+        if run_config.run_mode == "live":
+            if config.engine == "local" and not Path(config.speaker_wav).is_file():
+                messagebox.showwarning(
+                    "Reference voice required",
+                    "Choose a voice sample before live playback.",
+                    parent=root,
+                )
+                return
+            if config.engine == "elevenlabs" and not config.elevenlabs_voice_id:
+                messagebox.showwarning(
+                    "Voice ID required",
+                    "Restart with --elevenlabs-voice-id to use live playback.",
+                    parent=root,
+                )
+                return
+        status_var.set("Starting…")
+        status_bus.emit(
+            f"Starting {run_config.run_mode} mode. Models may take time to load on first use."
+        )
+        stop, recorder, processor = start_threads(run_config, status_bus)
+        state.update(stop=stop, threads=(recorder, processor))
+        set_controls(True)
+
+    def stop_app():
+        if state["stop"]:
+            state["stop"].set()
+            status_var.set("Stopping…")
+            status_bus.emit("Stopping after the current model or playback operation finishes.")
+            stop_button.configure(state="disabled")
+
+    def set_controls(running):
+        for widget in (start_button, live_radio, test_radio, refresh_button):
+            widget.configure(state="disabled" if running else "normal")
+        load_button.configure(state="disabled" if running or config.engine != "local" else "normal")
+        input_box.configure(state="disabled" if running else "readonly")
+        output_box.configure(state="disabled" if running else "readonly")
+        stop_button.configure(state="normal" if running else "disabled")
+
+    def poll_status():
+        if state["threads"] and not busy():
+            status_var.set("Stopped with an error" if state["stop"].failed else "Ready")
+            state.update(threads=(), stop=None)
+            set_controls(False)
+        elif (
+            busy() and state["stop"] and not state["stop"].is_set() and state["stop"].ready.is_set()
+        ):
+            status_var.set("Listening")
+        log.configure(state="normal")
+        while True:
+            try:
+                message = status_bus.queue.get_nowait()
+            except queue.Empty:
+                break
+            log.insert(tk.END, message + "\n")
+        if int(log.index("end-1c").split(".")[0]) > 1000:
+            log.delete("1.0", "200.0")
+        log.see(tk.END)
+        log.configure(state="disabled")
+        if state["closing"] and not busy():
+            root.destroy()
+            return
+        root.after(150, poll_status)
+
+    outer = ttk.Frame(root, padding=28)
+    outer.pack(fill="both", expand=True)
+    title_row = ttk.Frame(outer)
+    title_row.pack(fill="x")
+    ttk.Label(title_row, text="Caller", style="Title.TLabel").pack(side="left")
+    ttk.Label(title_row, textvariable=status_var, style="Muted.TLabel").pack(side="right")
+    ttk.Label(
+        outer, text="Your speech. Your voice. One controlled audio pipeline.", style="Muted.TLabel"
+    ).pack(anchor="w", pady=(4, 22))
+    ttk.Label(outer, text="AUDIO ROUTING", style="Muted.TLabel").pack(anchor="w")
+    routing = ttk.Frame(outer)
+    routing.pack(fill="x", pady=(8, 18))
+    routing.columnconfigure(1, weight=1)
+    ttk.Label(routing, text="Microphone").grid(row=0, column=0, sticky="w", padx=(0, 16), pady=4)
+    input_box = ttk.Combobox(routing, textvariable=input_var, values=list(inputs), state="readonly")
+    input_box.grid(row=0, column=1, sticky="ew", pady=4)
+    ttk.Label(routing, text="Playback").grid(row=1, column=0, sticky="w", pady=4)
+    output_box = ttk.Combobox(
+        routing, textvariable=output_var, values=list(outputs), state="readonly"
+    )
+    output_box.grid(row=1, column=1, sticky="ew", pady=4)
+    refresh_button = ttk.Button(routing, text="Refresh", command=refresh_devices)
+    refresh_button.grid(row=0, column=2, rowspan=2, padx=(12, 0))
+    ttk.Label(outer, text="REFERENCE VOICE", style="Muted.TLabel").pack(anchor="w")
+    reference = ttk.Frame(outer)
+    reference.pack(fill="x", pady=8)
+    load_button = ttk.Button(reference, text="Choose audio…", command=browse_voice)
+    load_button.pack(side="right", padx=(12, 0))
+    ttk.Label(reference, textvariable=speaker_var, wraplength=490).pack(
+        side="left", fill="x", expand=True
+    )
+    ttk.Label(outer, textvariable=detail_var, style="Muted.TLabel").pack(anchor="w")
+    ttk.Separator(outer).pack(fill="x", pady=18)
+    actions = ttk.Frame(outer)
+    actions.pack(fill="x")
+    test_radio = ttk.Radiobutton(actions, text="Transcribe only", variable=mode_var, value="test")
+    test_radio.pack(side="left")
+    live_radio = ttk.Radiobutton(actions, text="Live voice", variable=mode_var, value="live")
+    live_radio.pack(side="left", padx=12)
+    stop_button = ttk.Button(actions, text="Stop", command=stop_app)
+    stop_button.pack(side="right")
+    start_button = ttk.Button(
+        actions, text="Start session", command=start_app, style="Accent.TButton"
+    )
+    start_button.pack(side="right", padx=10)
+    ttk.Label(
+        outer,
+        text=f"{config.engine.upper()} · Whisper {config.model_name} · Transcript saving {'on' if config.log_transcripts else 'off'}",
+        style="Muted.TLabel",
+    ).pack(anchor="w", pady=(16, 8))
+    log_frame = ttk.Frame(outer)
+    log_frame.pack(fill="both", expand=True)
+    log = tk.Text(
+        log_frame,
+        height=10,
+        background="#142632",
+        foreground="#dbe8ed",
+        borderwidth=0,
+        padx=14,
+        pady=12,
+        font=("Menlo", 11),
+        wrap="word",
+        state="disabled",
+    )
+    scrollbar = ttk.Scrollbar(log_frame, command=log.yview)
+    log.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
+    log.pack(fill="both", expand=True)
+    ttk.Label(
+        outer,
+        text="Route playback to a virtual audio device, then select it as your call app’s microphone.",
+        style="Muted.TLabel",
+        wraplength=720,
+    ).pack(anchor="w", pady=(12, 0))
+    set_controls(False)
+    refresh_devices()
+    status_bus.emit("Ready. Select audio devices and a mode, then start a session.")
+    root.after(150, poll_status)
+
     def on_close():
+        state["closing"] = True
         stop_app()
-        root.destroy()
+        if not busy():
+            root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
@@ -632,7 +745,9 @@ def parse_args():
         help="Auto-detect spoken language during transcription.",
     )
     parser.add_argument("--elevenlabs-voice-id", default=None, help="ElevenLabs voice ID.")
-    parser.add_argument("--elevenlabs-clone-name", default="LocalClone", help="Name for ElevenLabs cloned voice.")
+    parser.add_argument(
+        "--elevenlabs-clone-name", default="LocalClone", help="Name for ElevenLabs cloned voice."
+    )
     parser.add_argument("--no-noise-reduction", action="store_true")
     parser.add_argument("--silence-chunks", type=int, default=None)
     parser.add_argument("--min-buffer-chunks", type=int, default=None)
@@ -649,7 +764,9 @@ def parse_args():
         default="balanced",
         help="Performance preset: balanced, max, or cpu (default: balanced).",
     )
-    parser.add_argument("--force-cpu", action="store_true", help="Run STT/TTS on CPU even when CUDA is available.")
+    parser.add_argument(
+        "--force-cpu", action="store_true", help="Run STT/TTS on CPU even when CUDA is available."
+    )
     parser.add_argument("--playback-device", type=int, default=None)
     parser.add_argument("--playback-block-size", type=int, default=2048)
     parser.add_argument("--self-check", action="store_true", help="Run diagnostics and exit.")
@@ -659,18 +776,43 @@ def parse_args():
         default="live",
         help="Run mode: live plays cloned output, test runs full analytics without playback.",
     )
-    parser.add_argument("--ui", action="store_true", help="Launch minimal control UI.")
-    return parser.parse_args()
+    parser.add_argument(
+        "--log-transcripts",
+        action="store_true",
+        help="Save recognized text to transcripts.txt (off by default).",
+    )
+    parser.add_argument(
+        "--list-devices", action="store_true", help="List input and output device indexes and exit."
+    )
+    parser.add_argument("--ui", action="store_true", help="Launch the voice studio control panel.")
+    args = parser.parse_args()
+    for name in ("silence_chunks", "min_buffer_chunks", "playback_block_size"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.min_buffer_chunks is not None and args.min_buffer_chunks > 469:
+        parser.error("--min-buffer-chunks must be at most 469")
+    if args.silence_chunks is not None and args.silence_chunks > 469:
+        parser.error("--silence-chunks must be at most 469")
+    import re
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.profile_name):
+        parser.error("--profile-name must contain 1–64 letters, digits, underscores or hyphens")
+    return args
+
 
 def main():
-    print("Powerful Real-Time Speech to Cloned Voice App")
-    print("Whisper STT + Local XTTS or ElevenLabs cloned voice with adaptive mood and per-word tracking")
-    print("GPU-aware, noise-reduced, and tuned for the lowest possible call latency")
     args = parse_args()
     if args.self_check:
-        report = render_report(run_self_check())
+        report = render_report(run_self_check(args.engine, args.run_mode))
         print(json.dumps(report, indent=2))
-        return
+        return 1 if report["summary"]["failed"] else 0
+    if args.list_devices:
+        from self_check import list_devices
+
+        print(json.dumps(list_devices(), indent=2))
+        return 0
+    load_runtime()
     apply_torch_performance_settings()
     if args.performance_mode == "cpu" or args.force_cpu:
         apply_cpu_performance_settings()
@@ -686,6 +828,12 @@ def main():
         force_cpu=force_cpu,
         quality_mode=args.quality_mode,
     )
+    if args.auto_language or args.language != "en":
+        if args.model and args.model.endswith(".en"):
+            raise ValueError(
+                "English-only .en models cannot be used with another/automatic language."
+            )
+        resolved_model = resolved_model.removesuffix(".en")
     print(f"Using Whisper model: {resolved_model}")
 
     devices = list_input_devices()
@@ -698,7 +846,7 @@ def main():
         device_index = resolve_device_index(args.device_index)
     except ValueError as exc:
         print(str(exc))
-        exit(1)
+        raise ValueError(str(exc)) from exc
     speaker_wav = args.speaker_wav
     normalized_wav = ""
     voice_profile = VoiceProfile(
@@ -709,48 +857,40 @@ def main():
         gain=1.0,
         silence_threshold=0,
     )
-    if args.record_speaker or (args.engine == "local" and not speaker_wav) or (
-        args.engine == "elevenlabs" and not args.elevenlabs_voice_id and not speaker_wav
-    ):
-        print("Record a short sample for the cloning model.")
-        filename = record_sample(device_index=device_index)
-        speaker_wav = filename
-    if args.engine == "local":
-        if not speaker_wav or not os.path.exists(speaker_wav):
-            print("A valid --speaker-wav is required for local cloning.")
-            exit(1)
-        voice_profile = analyze_speaker_wav(speaker_wav)
-        normalized_wav = normalize_speaker_wav(speaker_wav, voice_profile, args.profile_name)
-        save_profile(args.profile_name, voice_profile)
-        silence_threshold = max(
-            calibrate_silence_threshold(device_index=device_index),
-            voice_profile.silence_threshold,
-        )
-        print(f"Calibrated silence threshold: {silence_threshold}")
-        print(f"Auto-tuned playback gain: {voice_profile.gain:.2f}")
-        elevenlabs_voice_id = None
-    else:
-        silence_threshold = calibrate_silence_threshold(device_index=device_index)
-        if args.elevenlabs_voice_id:
-            elevenlabs_voice_id = args.elevenlabs_voice_id
+    elevenlabs_voice_id = args.elevenlabs_voice_id
+    silence_threshold = 500
+    if args.run_mode == "live":
+        if args.record_speaker:
+            speaker_wav = record_sample(device_index=device_index)
+        if args.engine == "local":
+            if speaker_wav:
+                voice_profile = analyze_speaker_wav(speaker_wav)
+                normalized_wav = normalize_speaker_wav(
+                    speaker_wav, voice_profile, args.profile_name
+                )
+                save_profile(args.profile_name, voice_profile)
+            elif not args.ui:
+                raise ValueError(
+                    "Provide --speaker-wav or --record-speaker, or use --ui to load a reference."
+                )
         else:
-            if not speaker_wav or not os.path.exists(speaker_wav):
-                print("Provide --speaker-wav or --record-speaker to clone with ElevenLabs.")
-                exit(1)
-            engine = ElevenLabsEngine(
-                ElevenLabsConfig(api_key=get_api_key(), voice_id="placeholder")
-            )
-            cloned = engine.clone_voice(args.elevenlabs_clone_name, [speaker_wav])
-            elevenlabs_voice_id = cloned.voice_id
-        normalized_wav = ""
-        voice_profile = VoiceProfile(
-            sample_rate=0,
-            duration_s=0.0,
-            rms=0.0,
-            peak=0.0,
-            gain=1.0,
-            silence_threshold=silence_threshold,
-        )
+            get_api_key()
+            if not elevenlabs_voice_id:
+                if not speaker_wav:
+                    raise ValueError(
+                        "Provide --elevenlabs-voice-id or --speaker-wav for ElevenLabs."
+                    )
+                engine = ElevenLabsEngine(
+                    ElevenLabsConfig(api_key=get_api_key(), voice_id="pending")
+                )
+                try:
+                    elevenlabs_voice_id = engine.clone_voice(
+                        args.elevenlabs_clone_name, [speaker_wav]
+                    ).voice_id
+                finally:
+                    engine.close()
+    if not args.ui:
+        silence_threshold = calibrate_silence_threshold(device_index=device_index)
 
     print("For Linux: Ensure virtual mic is set up with PulseAudio.")
     print("For Windows: Install VB-Audio Virtual Cable, set default output to 'CABLE Input'.")
@@ -762,8 +902,12 @@ def main():
         model_name=resolved_model,
         language=args.language,
         use_noise_reduction=not args.no_noise_reduction and preset.use_noise_reduction,
-        silence_chunks=args.silence_chunks if args.silence_chunks is not None else preset.silence_chunks,
-        min_buffer_chunks=args.min_buffer_chunks if args.min_buffer_chunks is not None else preset.min_buffer_chunks,
+        silence_chunks=args.silence_chunks
+        if args.silence_chunks is not None
+        else preset.silence_chunks,
+        min_buffer_chunks=args.min_buffer_chunks
+        if args.min_buffer_chunks is not None
+        else preset.min_buffer_chunks,
         silence_threshold=silence_threshold,
         device_index=device_index,
         playback_gain=voice_profile.gain if args.engine == "local" else 1.0,
@@ -777,6 +921,7 @@ def main():
         force_cpu=force_cpu,
         auto_language=args.auto_language,
         run_mode=args.run_mode,
+        log_transcripts=args.log_transcripts,
     )
 
     if args.ui:
@@ -787,14 +932,22 @@ def main():
     stop_event, record_thread, process_thread = start_threads(config, status_bus)
     print("Press Ctrl+C to stop.")
     try:
-        while True:
-            time.sleep(1)
+        while not stop_event.wait(0.2):
+            pass
     except KeyboardInterrupt:
         print("Stopping...")
+    finally:
         stop_event.set()
         record_thread.join()
         process_thread.join()
         print("Stopped.")
+    return 1 if stop_event.failed else 0
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except (ImportError, RuntimeError, ValueError, OSError) as exc:
+        print(f"Caller could not start: {exc}")
+        print("Run --self-check for dependency and device diagnostics.")
+        raise SystemExit(1)

@@ -23,6 +23,7 @@ QUALITY_EXCELLENT = 88
 QUALITY_GOOD = 74
 QUALITY_FAIR = 58
 
+
 @dataclass
 class QualityAssessment:
     score: float
@@ -36,43 +37,18 @@ def assess_call_quality(
     mood: str,
     has_word_timestamps: bool,
 ) -> QualityAssessment:
-    score = 100.0
-
-    if latency_ms > 1600:
-        score -= 35
-    elif latency_ms > 1000:
-        score -= 20
-    elif latency_ms > 700:
-        score -= 10
-
-    if speaking_rate_wpm > 190:
-        score -= 8
-    elif speaking_rate_wpm < 70 and speaking_rate_wpm > 0:
-        score -= 5
-
-    if mood == "negative":
-        score -= 6
-
-    if not has_word_timestamps:
-        score -= 4
-
-    score = max(0.0, min(100.0, score))
-
-    if score >= 88:
-        return QualityAssessment(score, "excellent", "Keep current settings.")
-    if score >= 74:
     """
     Assess call quality based on multiple metrics.
-    
+
     Args:
         latency_ms: Network latency in milliseconds (must be non-negative)
         speaking_rate_wpm: Speaking rate in words per minute (must be non-negative)
         mood: Detected mood sentiment (e.g., 'positive', 'negative')
         has_word_timestamps: Whether word-level timestamps are available
-    
+
     Returns:
         QualityAssessment with score, label, and recommendation
-        
+
     Raises:
         ValueError: If latency_ms or speaking_rate_wpm are negative
     """
@@ -81,7 +57,7 @@ def assess_call_quality(
         raise ValueError("latency_ms must be non-negative")
     if speaking_rate_wpm < 0:
         raise ValueError("speaking_rate_wpm must be non-negative")
-    
+
     score = 100.0
 
     if latency_ms > LATENCY_SEVERE_MS:
@@ -112,7 +88,6 @@ def assess_call_quality(
             "good",
             "Consider quality mode high for more natural output.",
         )
-    if score >= 58:
     if score >= QUALITY_FAIR:
         return QualityAssessment(
             score,
@@ -123,5 +98,4 @@ def assess_call_quality(
         score,
         "poor",
         "Switch to test mode, recalibrate voice sample, and reduce latency load.",
-    )
     )
