@@ -14,3 +14,5 @@ normalized_speakers/
 sample_*.wav
 temp_*.wav
 *.egg-info/
+
+exports/

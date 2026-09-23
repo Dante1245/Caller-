@@ -16,7 +16,14 @@ from pathlib import Path
 # Runtime dependencies are loaded only after CLI validation and diagnostics.
 from audio_capture import UtteranceBuffer, pcm_rms
 
-from conversation_ai import compute_speaking_rate_wpm, infer_intent, suggest_response_style
+from conversation_ai import (
+    compute_speaking_rate_wpm,
+    infer_intent,
+    suggest_response_style,
+    conversation_insights,
+)
+from stt_engine import STTConfig, load_stt, recognition_warnings
+from audio_metrics import measure_audio
 from elevenlabs_engine import ElevenLabsConfig, ElevenLabsEngine, get_api_key
 from usage_analytics import (
     UsageReport,
@@ -80,11 +87,39 @@ class AppConfig:
     auto_language: bool
     run_mode: str
     log_transcripts: bool = False
+    stt_backend: str = "whisper"
+    compute_type: str = "int8"
+    initial_prompt: str = ""
+    elevenlabs_model: str = "eleven_flash_v2_5"
+    voice_speed: float = 1.0
+    max_clip_seconds: float = 30.0
+    max_queue_seconds: float = 10.0
 
 
 class StatusBus:
     def __init__(self) -> None:
         self.queue: queue.Queue[str] = queue.Queue(maxsize=500)
+        self.lock = threading.Lock()
+        self.metrics = {"rms_dbfs": -120.0, "clipping_percent": 0.0, "utterances": 0, "dropped": 0}
+        self.transcripts = []
+
+    def update_metrics(self, **values):
+        with self.lock:
+            self.metrics.update(values)
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.metrics)
+
+    def remember(self, text):
+        with self.lock:
+            self.transcripts.append(text)
+            self.transcripts = self.transcripts[-200:]
+
+    def insights(self):
+        with self.lock:
+            text = " ".join(self.transcripts)
+        return conversation_insights(text)
 
     def emit(self, message: str) -> None:
         print(message)
@@ -118,12 +153,14 @@ def trim_silence(audio: np.ndarray, threshold: float = 0.01) -> np.ndarray:
     return audio[start:end]
 
 
-def record_sample(duration=5, filename=None, device_index=None):
+def record_sample(duration=8, filename=None, device_index=None, stop_event=None):
     """Capture a short, high-fidelity sample for cloning."""
     if not filename:
         filename = f"sample_{time.time()}.wav"
 
-    frames = capture_frames(duration, device_index)
+    frames = capture_frames(duration, device_index, stop_event)
+    if stop_event is not None and stop_event.is_set():
+        return None
     with wave.open(filename, "wb") as wf:
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(2)
@@ -133,7 +170,7 @@ def record_sample(duration=5, filename=None, device_index=None):
     return filename
 
 
-def capture_frames(seconds, device_index=None):
+def capture_frames(seconds, device_index=None, stop_event=None):
     with sd.RawInputStream(
         samplerate=SAMPLE_RATE,
         channels=CHANNELS,
@@ -141,9 +178,12 @@ def capture_frames(seconds, device_index=None):
         blocksize=CHUNK,
         device=device_index,
     ) as stream:
-        return [
-            bytes(stream.read(CHUNK)[0]) for _ in range(max(1, int(SAMPLE_RATE / CHUNK * seconds)))
-        ]
+        frames = []
+        for _ in range(max(1, int(SAMPLE_RATE / CHUNK * seconds))):
+            if stop_event is not None and stop_event.is_set():
+                break
+            frames.append(bytes(stream.read(CHUNK)[0]))
+        return frames
 
 
 def is_silent(data, threshold=500):
@@ -151,13 +191,11 @@ def is_silent(data, threshold=500):
     return pcm_rms(data) < threshold
 
 
-def get_device_and_model(model_name=None, force_cpu=False):
-    """Pick the fastest Whisper model based on available hardware."""
+def get_device_and_model(model_name=None, force_cpu=False, backend="whisper", compute_type="int8"):
     device = "cpu" if force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
     preferred_model = model_name or ("small.en" if device == "cuda" else "base.en")
-    print(f"Loading Whisper model '{preferred_model}' on {device} for optimized quality/latency...")
-    model = whisper.load_model(preferred_model, device=device)
-    return model
+    print(f"Loading {backend} model '{preferred_model}' on {device}...")
+    return load_stt(STTConfig(preferred_model, backend, device, compute_type))
 
 
 def resolve_whisper_model(model_name=None, force_cpu=False, quality_mode="balanced"):
@@ -218,7 +256,10 @@ def calibrate_silence_threshold(device_index=None, seconds=1.5):
 def real_time_record(audio_queue, stop_event, config: AppConfig, status_bus: StatusBus):
     """Continuously record audio, detect silence, and enqueue denoised clips."""
     segmenter = UtteranceBuffer(
-        config.silence_threshold, config.silence_chunks, config.min_buffer_chunks, max_chunks=469
+        config.silence_threshold,
+        config.silence_chunks,
+        config.min_buffer_chunks,
+        max_chunks=max(1, int(getattr(config, "max_clip_seconds", 30) * SAMPLE_RATE / CHUNK)),
     )
     with sd.RawInputStream(
         samplerate=SAMPLE_RATE,
@@ -232,15 +273,16 @@ def real_time_record(audio_queue, stop_event, config: AppConfig, status_bus: Sta
             data, overflowed = stream.read(CHUNK)
             if overflowed:
                 status_bus.emit("Microphone overflow: some input samples were lost.")
+            level_audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768
+            status_bus.update_metrics(**measure_audio(level_audio))
             clip = segmenter.feed(bytes(data))
             if clip is None:
                 continue
             audio = np.frombuffer(clip, dtype=np.int16).astype(np.float32) / 32768.0
-            if config.use_noise_reduction:
-                audio = nr.reduce_noise(y=audio, sr=SAMPLE_RATE)
             try:
-                audio_queue.put_nowait(audio)
+                audio_queue.put_nowait((time.monotonic(), audio))
             except queue.Full:
+                status_bus.update_metrics(dropped=status_bus.snapshot()["dropped"] + 1)
                 status_bus.emit("Processing is behind; dropped a new clip. Try a smaller model.")
 
 
@@ -273,7 +315,12 @@ def log_transcript(
 
 
 def process_audio(audio_queue, stop_event, config: AppConfig, status_bus: StatusBus):
-    model = get_device_and_model(config.model_name, force_cpu=config.force_cpu)
+    model = get_device_and_model(
+        config.model_name,
+        force_cpu=config.force_cpu,
+        backend=getattr(config, "stt_backend", "whisper"),
+        compute_type=getattr(config, "compute_type", "int8"),
+    )
     tts_engine = None
     gain_controller = None
     playback = None
@@ -284,7 +331,9 @@ def process_audio(audio_queue, stop_event, config: AppConfig, status_bus: Status
         from tts_engine import LocalTTS
 
         tts_engine = LocalTTS(
-            model_name=config.tts_model, device="cpu" if config.force_cpu else None
+            model_name=config.tts_model,
+            device="cpu" if config.force_cpu else None,
+            speed=config.voice_speed,
         )
         gain_controller = AdaptiveGain(config.playback_gain)
         playback = PlaybackEngine(
@@ -301,6 +350,8 @@ def process_audio(audio_queue, stop_event, config: AppConfig, status_bus: Status
                 voice_id=config.elevenlabs_voice_id,
                 device=config.playback_device,
                 block_size=config.playback_block_size,
+                model_id=config.elevenlabs_model,
+                speed=config.voice_speed,
             )
         )
     try:
@@ -314,7 +365,17 @@ def process_audio(audio_queue, stop_event, config: AppConfig, status_bus: Status
             audio_file = None
             try:
                 audio_file = audio_queue.get(timeout=0.2)
+                if isinstance(audio_file, tuple):
+                    captured_at, audio_file = audio_file
+                    queue_age = time.monotonic() - captured_at
+                    if queue_age > getattr(config, "max_queue_seconds", 10):
+                        status_bus.update_metrics(dropped=status_bus.snapshot()["dropped"] + 1)
+                        status_bus.emit("Discarded a stale phrase to avoid delayed speech.")
+                        continue
                 start_time = time.perf_counter()
+                audio_stats = measure_audio(audio_file)
+                if getattr(config, "use_noise_reduction", False):
+                    audio_file = nr.reduce_noise(y=audio_file, sr=SAMPLE_RATE)
                 if stop_event.is_set():
                     break
                 transcription_language = None if config.auto_language else config.language
@@ -326,12 +387,19 @@ def process_audio(audio_queue, stop_event, config: AppConfig, status_bus: Status
                     temperature=0.0,
                     best_of=1,
                     beam_size=1,
+                    initial_prompt=getattr(config, "initial_prompt", "") or None,
+                    condition_on_previous_text=False,
                 )
                 text = result.get("text", "").strip()
                 if not text:
                     continue
                 detected_language = result.get("language", config.language)
-                mood, compound = analyze_mood(text)
+                mood, compound = (
+                    analyze_mood(text) if detected_language == "en" else ("unavailable", 0.0)
+                )
+                for warning in recognition_warnings(result):
+                    status_bus.emit(warning)
+                status_bus.remember(text)
                 word_timings = extract_word_timestamps(result)
                 intent = infer_intent(text)
                 utterance_duration = None
@@ -370,19 +438,26 @@ def process_audio(audio_queue, stop_event, config: AppConfig, status_bus: Status
                         gain_controller,
                         playback,
                         mood,
+                        stop_event=stop_event,
                     )
                 else:
-                    text_to_elevenlabs_voice(text, elevenlabs_engine, mood)
+                    elevenlabs_engine.synthesize(
+                        text, mood, stop_event=stop_event, muted=getattr(stop_event, "muted", None)
+                    )
                 latency_ms = (time.perf_counter() - start_time) * 1000
+                status_bus.update_metrics(
+                    latency_ms=latency_ms, utterances=status_bus.snapshot()["utterances"] + 1
+                )
                 status_bus.emit(f"Processing + playback latency: {latency_ms:.1f} ms")
                 quality = assess_call_quality(
                     latency_ms=latency_ms,
                     speaking_rate_wpm=speaking_rate_wpm,
                     mood=mood,
                     has_word_timestamps=bool(word_timings),
+                    **{key: audio_stats[key] for key in ("rms_dbfs", "clipping_percent")},
                 )
                 status_bus.emit(
-                    f"Quality score: {quality.score:.1f}/100 ({quality.label}) | tip: {quality.recommendation}"
+                    f"Pipeline score (heuristic): {quality.score:.1f}/100 ({quality.label}) | tip: {quality.recommendation}"
                 )
                 report = update_report(report, latency_ms, len(text.split()), config.profile_name)
                 save_report(report)
@@ -419,8 +494,13 @@ def text_to_cloned_voice(
     gain_controller: AdaptiveGain,
     playback: PlaybackEngine,
     mood="neutral",
+    stop_event=None,
 ):
     """Synthesize and play cloned voice using local XTTS."""
+    if stop_event is not None and (
+        stop_event.is_set() or getattr(stop_event, "muted", threading.Event()).is_set()
+    ):
+        return
     result = tts_engine.synthesize(
         text=text,
         speaker_wav=config.speaker_wav,
@@ -432,7 +512,7 @@ def text_to_cloned_voice(
     audio = np.clip(audio, -1.0, 1.0)
     audio = trim_silence(audio)
     print(f"Playing cloned voice (mood={mood})")
-    playback.play(audio)
+    playback.play(audio, stop_event=stop_event, muted=getattr(stop_event, "muted", None))
 
 
 def text_to_elevenlabs_voice(text: str, engine: ElevenLabsEngine, mood: str) -> None:
@@ -459,6 +539,7 @@ def start_threads(config: AppConfig, status_bus: StatusBus):
     stop_event = threading.Event()
     stop_event.ready = threading.Event()
     stop_event.failed = False
+    stop_event.muted = threading.Event()
 
     def guarded(target):
         try:
@@ -488,8 +569,8 @@ def run_control_ui(config: AppConfig):
 
     root = tk.Tk()
     root.title("Caller · Voice studio")
-    root.geometry("820x700")
-    root.minsize(700, 620)
+    root.geometry("920x780")
+    root.minsize(820, 720)
     root.configure(background="#f3f5f7")
     style = ttk.Style(root)
     style.theme_use("clam")
@@ -501,7 +582,8 @@ def run_control_ui(config: AppConfig):
     style.configure("Accent.TButton", background="#176c60", foreground="white")
     style.configure("TRadiobutton", background="#f3f5f7", font=("Helvetica", 11))
     status_bus = StatusBus()
-    state = {"threads": (), "stop": None, "closing": False}
+    state = {"threads": (), "stop": None, "closing": False, "operation": "Listening"}
+    tool_results = queue.Queue()
     speaker_var = tk.StringVar(
         root, value=config.speaker_wav or "Choose a reference voice for local playback"
     )
@@ -511,6 +593,214 @@ def run_control_ui(config: AppConfig):
     input_var = tk.StringVar(root, value="System default")
     output_var = tk.StringVar(root, value="System default")
     inputs, outputs = {"System default": None}, {"System default": None}
+    backend_var = tk.StringVar(root, value=config.stt_backend)
+    model_var = tk.StringVar(root, value=config.model_name)
+    language_var = tk.StringVar(root, value="auto" if config.auto_language else config.language)
+    engine_var = tk.StringVar(root, value=config.engine)
+    voice_var = tk.StringVar(root, value=config.elevenlabs_voice_id or "")
+    cloud_model_var = tk.StringVar(root, value=config.elevenlabs_model)
+    speed_var = tk.StringVar(root, value=str(config.voice_speed))
+    prompt_var = tk.StringVar(root, value=config.initial_prompt)
+    threshold_var = tk.StringVar(root, value=str(config.silence_threshold))
+    noise_var = tk.BooleanVar(root, value=config.use_noise_reduction)
+    mute_var = tk.BooleanVar(root, value=False)
+    metrics_var = tk.StringVar(root, value="Input — · 0 phrases · 0 dropped")
+    settings_widgets = []
+
+    def selected_config():
+        model = model_var.get().strip()
+        language = language_var.get().strip().lower()
+        if not model or not language:
+            raise ValueError("Choose a model and a language (or auto).")
+        if language != "en" and model.endswith(".en"):
+            raise ValueError("Choose a multilingual model, such as base, for this language.")
+        if backend_var.get() == "faster-whisper" and model.endswith(".pt"):
+            raise ValueError(
+                "Faster-whisper requires a model name or a converted model directory, not a .pt file."
+            )
+        speed = float(speed_var.get())
+        threshold = int(threshold_var.get())
+        if not 0.7 <= speed <= 1.2 or not 1 <= threshold <= 32768:
+            raise ValueError("Speed must be 0.7–1.2; microphone threshold must be 1–32768.")
+        if len(prompt_var.get()) > 2000:
+            raise ValueError("Vocabulary hint must be at most 2000 characters.")
+        return replace(
+            config,
+            run_mode=mode_var.get(),
+            device_index=inputs[input_var.get()],
+            playback_device=outputs[output_var.get()],
+            stt_backend=backend_var.get(),
+            model_name=model,
+            language="en" if language == "auto" else language,
+            auto_language=language == "auto",
+            engine=engine_var.get(),
+            elevenlabs_voice_id=voice_var.get().strip() or None,
+            elevenlabs_model=cloud_model_var.get().strip(),
+            voice_speed=speed,
+            initial_prompt=prompt_var.get(),
+            silence_threshold=threshold,
+            use_noise_reduction=noise_var.get(),
+        )
+
+    def run_tool(label, action):
+        if busy():
+            return
+        stop = threading.Event()
+        stop.failed = False
+        stop.ready = threading.Event()
+        stop.muted = threading.Event()
+
+        def worker():
+            try:
+                action(stop)
+            except Exception as exc:
+                stop.failed = True
+                status_bus.emit(f"{label} failed: {exc}")
+
+        thread = threading.Thread(target=worker, daemon=True)
+        state.update(stop=stop, threads=(thread,), operation=label)
+        status_var.set(label)
+        set_controls(True)
+        thread.start()
+
+    def calibrate_input():
+        device = inputs[input_var.get()]
+        status_bus.emit("Calibrating ambient sound for 1.5 seconds. Please stay quiet.")
+
+        def action(stop):
+            threshold = calibrate_silence_threshold(device)
+            if not stop.is_set():
+                tool_results.put(("threshold", threshold))
+                status_bus.emit(f"Calibrated microphone threshold: {threshold}")
+
+        run_tool("Calibrating…", action)
+
+    def record_reference():
+        path = filedialog.asksaveasfilename(
+            parent=root,
+            title="Record an 8-second reference",
+            initialfile="my-reference.wav",
+            defaultextension=".wav",
+        )
+        if not path:
+            return
+        device = inputs[input_var.get()]
+        status_bus.emit("Recording reference for 8 seconds. Speak naturally in a quiet room.")
+
+        def action(stop):
+            recorded = record_sample(8, path, device, stop_event=stop)
+            if recorded is not None:
+                profile = analyze_speaker_wav(recorded)
+                normalized = normalize_speaker_wav(recorded, profile, config.profile_name)
+                save_profile(config.profile_name, profile)
+                tool_results.put(("reference", (normalized, profile)))
+                status_bus.emit(f"Reference recorded: {recorded}")
+
+        run_tool("Recording reference…", action)
+
+    def transcribe_recording():
+        try:
+            chosen = selected_config()
+        except ValueError as exc:
+            messagebox.showerror("Check settings", str(exc), parent=root)
+            return
+        path = filedialog.askopenfilename(parent=root, title="Choose a recording")
+        if not path:
+            return
+        prefix = filedialog.asksaveasfilename(
+            parent=root,
+            title="Export name (creates JSON, TXT and SRT)",
+            initialfile=Path(path).stem + "-transcript",
+        )
+        if not prefix:
+            return
+
+        def action(stop):
+            from transcript_tools import transcribe_file, export_transcription
+
+            result = transcribe_file(
+                path,
+                STTConfig(
+                    chosen.model_name,
+                    chosen.stt_backend,
+                    "cuda" if torch.cuda.is_available() and not chosen.force_cpu else "cpu",
+                    chosen.compute_type,
+                ),
+                language=None if chosen.auto_language else chosen.language,
+                initial_prompt=chosen.initial_prompt or None,
+                stop_event=stop,
+            )
+            if result is not None:
+                files = export_transcription(result, prefix)
+                status_bus.remember(result.get("text", ""))
+                status_bus.emit(result.get("text", ""))
+                status_bus.emit("Exported: " + ", ".join(files))
+
+        run_tool("Transcribing file…", action)
+
+    def show_insights():
+        result = status_bus.insights()
+        if not result["word_count"]:
+            messagebox.showinfo(
+                "No transcript yet", "Run a session or transcribe a recording first.", parent=root
+            )
+            return
+        window = tk.Toplevel(root)
+        window.title("Caller · Transcript insights")
+        window.geometry("700x500")
+        text = tk.Text(window, wrap="word", padx=18, pady=18)
+        text.pack(fill="both", expand=True)
+        lines = [
+            "EXTRACTIVE SUMMARY",
+            *result["summary"],
+            "",
+            "CANDIDATE ACTIONS",
+            *result["candidate_actions"],
+            "",
+            "QUESTIONS",
+            *result["questions"],
+            "",
+            "Keywords: " + ", ".join(result["keywords"]),
+            "",
+            "English text heuristics; verify candidate actions against the transcript.",
+        ]
+        text.insert("1.0", "\n".join(lines))
+        text.configure(state="disabled")
+
+        def export():
+            path = filedialog.asksaveasfilename(
+                parent=window, defaultextension=".json", initialfile="conversation-insights.json"
+            )
+            if path:
+                from storage import write_object
+
+                try:
+                    write_object(path, result)
+                except OSError as exc:
+                    messagebox.showerror("Export failed", str(exc), parent=window)
+
+        ttk.Button(window, text="Export insights…", command=export).pack(pady=10)
+
+    def toggle_mute():
+        if state["stop"] is not None:
+            event = state["stop"].muted
+            event.set() if mute_var.get() else event.clear()
+
+    def run_diagnostics():
+        engine, backend, mode = engine_var.get(), backend_var.get(), mode_var.get()
+
+        def action(stop):
+            report = render_report(run_self_check(engine, mode, backend))
+            summary = report["summary"]
+            status_bus.emit(
+                f"Diagnostics: {summary['passed']} passed, {summary['failed']} need attention."
+            )
+            for check in report["results"]:
+                status_bus.emit(
+                    f"{'OK' if check['ok'] else 'CHECK'} · {check['name']}: {check['detail']}"
+                )
+
+        run_tool("Checking runtime…", action)
 
     def busy():
         return any(t.is_alive() for t in state["threads"])
@@ -549,6 +839,8 @@ def run_control_ui(config: AppConfig):
             save_profile(config.profile_name, profile)
             config.playback_gain = profile.gain
             speaker_var.set(config.speaker_wav)
+            for warning in profile.warnings or []:
+                status_bus.emit(warning)
             detail_var.set(
                 f"{profile.duration_s:.1f} seconds · {profile.sample_rate:,} Hz · gain {profile.gain:.2f}"
             )
@@ -558,33 +850,25 @@ def run_control_ui(config: AppConfig):
     def start_app():
         if busy():
             return
-        run_config = replace(
-            config,
-            run_mode=mode_var.get(),
-            device_index=inputs[input_var.get()],
-            playback_device=outputs[output_var.get()],
-        )
-        if run_config.run_mode == "live":
-            if config.engine == "local" and not Path(config.speaker_wav).is_file():
-                messagebox.showwarning(
-                    "Reference voice required",
-                    "Choose a voice sample before live playback.",
-                    parent=root,
-                )
-                return
-            if config.engine == "elevenlabs" and not config.elevenlabs_voice_id:
-                messagebox.showwarning(
-                    "Voice ID required",
-                    "Restart with --elevenlabs-voice-id to use live playback.",
-                    parent=root,
-                )
-                return
+        try:
+            run_config = selected_config()
+            if run_config.run_mode == "live":
+                if run_config.engine == "local" and not Path(run_config.speaker_wav).is_file():
+                    raise ValueError("Choose a reference sample before local voice playback.")
+                if run_config.engine == "elevenlabs":
+                    get_api_key()
+                    if not run_config.elevenlabs_voice_id or not run_config.elevenlabs_model:
+                        raise ValueError("Enter the ElevenLabs voice ID and model in AI settings.")
+        except (ValueError, RuntimeError) as exc:
+            messagebox.showwarning("Check settings", str(exc), parent=root)
+            return
         status_var.set("Starting…")
         status_bus.emit(
             f"Starting {run_config.run_mode} mode. Models may take time to load on first use."
         )
         stop, recorder, processor = start_threads(run_config, status_bus)
-        state.update(stop=stop, threads=(recorder, processor))
+        state.update(stop=stop, threads=(recorder, processor), operation="Listening")
+        toggle_mute()
         set_controls(True)
 
     def stop_app():
@@ -595,12 +879,29 @@ def run_control_ui(config: AppConfig):
             stop_button.configure(state="disabled")
 
     def set_controls(running):
-        for widget in (start_button, live_radio, test_radio, refresh_button):
+        for widget in (
+            start_button,
+            live_radio,
+            test_radio,
+            refresh_button,
+            calibrate_button,
+            file_button,
+            diagnostics_button,
+            record_button,
+        ):
             widget.configure(state="disabled" if running else "normal")
-        load_button.configure(state="disabled" if running or config.engine != "local" else "normal")
+        load_button.configure(state="disabled" if running else "normal")
         input_box.configure(state="disabled" if running else "readonly")
         output_box.configure(state="disabled" if running else "readonly")
         stop_button.configure(state="normal" if running else "disabled")
+        for widget in settings_widgets:
+            widget.configure(
+                state="disabled"
+                if running
+                else "readonly"
+                if isinstance(widget, ttk.Combobox) and widget is not model_box
+                else "normal"
+            )
 
     def poll_status():
         if state["threads"] and not busy():
@@ -610,7 +911,24 @@ def run_control_ui(config: AppConfig):
         elif (
             busy() and state["stop"] and not state["stop"].is_set() and state["stop"].ready.is_set()
         ):
-            status_var.set("Listening")
+            status_var.set(state["operation"])
+        while not tool_results.empty():
+            kind, value = tool_results.get_nowait()
+            if kind == "threshold":
+                threshold_var.set(str(value))
+            elif kind == "reference":
+                path, profile = value
+                config.speaker_wav = path
+                config.playback_gain = profile.gain
+                speaker_var.set(path)
+                detail_var.set(f"{profile.duration_s:.1f} seconds · {profile.sample_rate:,} Hz")
+                for warning in profile.warnings or []:
+                    status_bus.emit(warning)
+        metrics = status_bus.snapshot()
+        meter["value"] = max(0, min(100, (metrics["rms_dbfs"] + 60) / 60 * 100))
+        metrics_var.set(
+            f"Input {metrics['rms_dbfs']:.0f} dBFS · {metrics['utterances']} phrases · {metrics['dropped']} dropped · {metrics.get('latency_ms', 0):.0f} ms"
+        )
         log.configure(state="normal")
         while True:
             try:
@@ -636,8 +954,16 @@ def run_control_ui(config: AppConfig):
     ttk.Label(
         outer, text="Your speech. Your voice. One controlled audio pipeline.", style="Muted.TLabel"
     ).pack(anchor="w", pady=(4, 22))
-    ttk.Label(outer, text="AUDIO ROUTING", style="Muted.TLabel").pack(anchor="w")
-    routing = ttk.Frame(outer)
+    tabs = ttk.Notebook(outer)
+    tabs.pack(fill="x", pady=(0, 14))
+    audio_tab = ttk.Frame(tabs, padding=14)
+    ai_tab = ttk.Frame(tabs, padding=14)
+    tools_tab = ttk.Frame(tabs, padding=14)
+    tabs.add(audio_tab, text="Audio & reference")
+    tabs.add(ai_tab, text="AI settings")
+    tabs.add(tools_tab, text="Tools")
+    ttk.Label(audio_tab, text="AUDIO ROUTING", style="Muted.TLabel").pack(anchor="w")
+    routing = ttk.Frame(audio_tab)
     routing.pack(fill="x", pady=(8, 18))
     routing.columnconfigure(1, weight=1)
     ttk.Label(routing, text="Microphone").grid(row=0, column=0, sticky="w", padx=(0, 16), pady=4)
@@ -650,33 +976,107 @@ def run_control_ui(config: AppConfig):
     output_box.grid(row=1, column=1, sticky="ew", pady=4)
     refresh_button = ttk.Button(routing, text="Refresh", command=refresh_devices)
     refresh_button.grid(row=0, column=2, rowspan=2, padx=(12, 0))
-    ttk.Label(outer, text="REFERENCE VOICE", style="Muted.TLabel").pack(anchor="w")
-    reference = ttk.Frame(outer)
+    ttk.Label(audio_tab, text="REFERENCE VOICE", style="Muted.TLabel").pack(anchor="w")
+    reference = ttk.Frame(audio_tab)
     reference.pack(fill="x", pady=8)
     load_button = ttk.Button(reference, text="Choose audio…", command=browse_voice)
     load_button.pack(side="right", padx=(12, 0))
     ttk.Label(reference, textvariable=speaker_var, wraplength=490).pack(
         side="left", fill="x", expand=True
     )
-    ttk.Label(outer, textvariable=detail_var, style="Muted.TLabel").pack(anchor="w")
-    ttk.Separator(outer).pack(fill="x", pady=18)
+    ttk.Label(audio_tab, textvariable=detail_var, style="Muted.TLabel").pack(anchor="w")
+    ai_tab.columnconfigure(1, weight=1)
+    ai_tab.columnconfigure(3, weight=1)
+
+    def field(row, column, label, variable, values=None, editable=False):
+        ttk.Label(ai_tab, text=label).grid(row=row, column=column, sticky="w", padx=(0, 10), pady=4)
+        widget = (
+            ttk.Combobox(
+                ai_tab,
+                textvariable=variable,
+                values=values,
+                width=18,
+                state="normal" if editable else "readonly",
+            )
+            if values
+            else ttk.Entry(ai_tab, textvariable=variable, width=20)
+        )
+        widget.grid(row=row, column=column + 1, sticky="ew", padx=(0, 14), pady=4)
+        settings_widgets.append(widget)
+        return widget
+
+    field(0, 0, "Recognition", backend_var, ["whisper", "faster-whisper"])
+    model_box = field(
+        0,
+        2,
+        "Model",
+        model_var,
+        ["tiny.en", "base.en", "small.en", "base", "small", "large-v3", "turbo"],
+        True,
+    )
+    field(1, 0, "Language", language_var)
+    field(1, 2, "Voice engine", engine_var, ["local", "elevenlabs"])
+    field(2, 0, "Cloud voice ID", voice_var)
+    field(2, 2, "Cloud model", cloud_model_var)
+    field(3, 0, "Voice speed", speed_var)
+    field(3, 2, "Silence RMS", threshold_var)
+    field(4, 0, "Vocabulary hint", prompt_var)
+    noise_box = ttk.Checkbutton(ai_tab, text="Reduce background noise", variable=noise_var)
+    noise_box.grid(row=4, column=2, columnspan=2, sticky="w")
+    settings_widgets.append(noise_box)
+    ttk.Label(
+        ai_tab,
+        text="Use a language code (en, es, fr…) or auto. Faster-whisper requires requirements-fast.txt.",
+        style="Muted.TLabel",
+        wraplength=780,
+    ).grid(row=5, column=0, columnspan=4, sticky="w", pady=8)
+    ttk.Label(tools_tab, text="LOCAL AUDIO TOOLS", style="Muted.TLabel").pack(
+        anchor="w", pady=(0, 10)
+    )
+    file_button = ttk.Button(
+        tools_tab, text="Transcribe a recording → JSON / TXT / SRT", command=transcribe_recording
+    )
+    file_button.pack(anchor="w", pady=4)
+    record_button = ttk.Button(
+        tools_tab, text="Record an 8-second voice reference…", command=record_reference
+    )
+    record_button.pack(anchor="w", pady=4)
+    calibrate_button = ttk.Button(
+        tools_tab, text="Calibrate microphone (stay quiet)", command=calibrate_input
+    )
+    calibrate_button.pack(anchor="w", pady=4)
+    diagnostics_button = ttk.Button(
+        tools_tab, text="Check runtime & devices", command=run_diagnostics
+    )
+    diagnostics_button.pack(anchor="w", pady=4)
+    ttk.Button(tools_tab, text="View conversation insights…", command=show_insights).pack(
+        anchor="w", pady=4
+    )
+    ttk.Label(
+        tools_tab,
+        text="File transcription stays local. Exports are saved only when you choose a destination.",
+        style="Muted.TLabel",
+        wraplength=780,
+    ).pack(anchor="w", pady=10)
+    ttk.Separator(outer).pack(fill="x", pady=8)
     actions = ttk.Frame(outer)
     actions.pack(fill="x")
     test_radio = ttk.Radiobutton(actions, text="Transcribe only", variable=mode_var, value="test")
     test_radio.pack(side="left")
     live_radio = ttk.Radiobutton(actions, text="Live voice", variable=mode_var, value="live")
     live_radio.pack(side="left", padx=12)
+    ttk.Checkbutton(actions, text="Mute voice", variable=mute_var, command=toggle_mute).pack(
+        side="left"
+    )
     stop_button = ttk.Button(actions, text="Stop", command=stop_app)
     stop_button.pack(side="right")
     start_button = ttk.Button(
         actions, text="Start session", command=start_app, style="Accent.TButton"
     )
     start_button.pack(side="right", padx=10)
-    ttk.Label(
-        outer,
-        text=f"{config.engine.upper()} · Whisper {config.model_name} · Transcript saving {'on' if config.log_transcripts else 'off'}",
-        style="Muted.TLabel",
-    ).pack(anchor="w", pady=(16, 8))
+    ttk.Label(outer, textvariable=metrics_var, style="Muted.TLabel").pack(anchor="w", pady=(14, 4))
+    meter = ttk.Progressbar(outer, maximum=100)
+    meter.pack(fill="x", pady=(0, 12))
     log_frame = ttk.Frame(outer)
     log_frame.pack(fill="both", expand=True)
     log = tk.Text(
@@ -785,7 +1185,73 @@ def parse_args():
         "--list-devices", action="store_true", help="List input and output device indexes and exit."
     )
     parser.add_argument("--ui", action="store_true", help="Launch the voice studio control panel.")
+    parser.add_argument("--stt-backend", choices=["whisper", "faster-whisper"], default="whisper")
+    parser.add_argument(
+        "--compute-type", choices=["int8", "float32", "float16", "int8_float16"], default="int8"
+    )
+    parser.add_argument(
+        "--initial-prompt", default="", help="Vocabulary/context hint for speech recognition."
+    )
+    parser.add_argument(
+        "--input-file", help="Transcribe an existing recording without opening a microphone."
+    )
+    parser.add_argument(
+        "--task",
+        choices=["transcribe", "translate"],
+        default="transcribe",
+        help="File mode: translate speech into English.",
+    )
+    parser.add_argument(
+        "--output",
+        help="File mode: output prefix for JSON, TXT and SRT exports (never overwrites).",
+    )
+    parser.add_argument("--inspect-reference", help="Analyze a reference audio file and exit.")
+    parser.add_argument(
+        "--list-voices", action="store_true", help="List your ElevenLabs voices; requires API key."
+    )
+    parser.add_argument(
+        "--list-cloud-models",
+        action="store_true",
+        help="List ElevenLabs speech models; requires API key.",
+    )
+    parser.add_argument("--elevenlabs-model", default="eleven_flash_v2_5")
+    parser.add_argument(
+        "--voice-speed", type=float, default=1.0, help="Voice synthesis speed: 0.7–1.2."
+    )
+    parser.add_argument("--max-clip-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--max-queue-seconds",
+        type=float,
+        default=10.0,
+        help="Discard phrases delayed longer than this.",
+    )
+    parser.add_argument("--diagnostics-output", help="Write self-check JSON to this file.")
     args = parser.parse_args()
+    import math
+
+    for name, low, high in (
+        ("voice_speed", 0.7, 1.2),
+        ("max_clip_seconds", 1, 60),
+        ("max_queue_seconds", 0.1, 120),
+    ):
+        value = getattr(args, name)
+        if not math.isfinite(value) or not low <= value <= high:
+            parser.error(f"--{name.replace('_', '-')} must be between {low} and {high}")
+    if args.output and not args.input_file:
+        parser.error("--output requires --input-file")
+    if args.input_file and args.ui:
+        parser.error("Use --input-file or --ui, not both")
+    if args.task == "translate" and not args.input_file:
+        parser.error("--task translate requires --input-file")
+    if args.task == "translate" and args.model and args.model.endswith(".en"):
+        parser.error("Translation requires a multilingual model (for example --model base)")
+    if args.compute_type in ("float16", "int8_float16") and (
+        args.force_cpu or args.performance_mode == "cpu"
+    ):
+        parser.error("CPU mode requires --compute-type int8 or float32")
+    if len(args.initial_prompt) > 2000:
+        parser.error("--initial-prompt must be at most 2000 characters")
+
     for name in ("silence_chunks", "min_buffer_chunks", "playback_block_size"):
         value = getattr(args, name)
         if value is not None and value <= 0:
@@ -798,19 +1264,41 @@ def parse_args():
 
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.profile_name):
         parser.error("--profile-name must contain 1–64 letters, digits, underscores or hyphens")
+    maximum_chunks = int(args.max_clip_seconds * SAMPLE_RATE / CHUNK)
+    if args.min_buffer_chunks and args.min_buffer_chunks + 3 > maximum_chunks:
+        parser.error("Minimum speech buffer plus pre-roll exceeds maximum clip duration")
     return args
 
 
 def main():
     args = parse_args()
     if args.self_check:
-        report = render_report(run_self_check(args.engine, args.run_mode))
+        report = render_report(run_self_check(args.engine, args.run_mode, args.stt_backend))
+        if args.diagnostics_output:
+            from storage import write_object
+
+            write_object(args.diagnostics_output, report)
         print(json.dumps(report, indent=2))
         return 1 if report["summary"]["failed"] else 0
     if args.list_devices:
         from self_check import list_devices
 
         print(json.dumps(list_devices(), indent=2))
+        return 0
+    if args.list_voices or args.list_cloud_models:
+        from elevenlabs_engine import list_cloud_resources
+
+        print(
+            json.dumps(
+                list_cloud_resources("models" if args.list_cloud_models else "voices"), indent=2
+            )
+        )
+        return 0
+    if args.inspect_reference:
+        from dataclasses import asdict
+        from voice_profile import analyze_speaker_wav
+
+        print(json.dumps(asdict(analyze_speaker_wav(args.inspect_reference)), indent=2))
         return 0
     load_runtime()
     apply_torch_performance_settings()
@@ -828,13 +1316,36 @@ def main():
         force_cpu=force_cpu,
         quality_mode=args.quality_mode,
     )
-    if args.auto_language or args.language != "en":
+    if args.auto_language or args.language != "en" or args.task == "translate":
         if args.model and args.model.endswith(".en"):
             raise ValueError(
                 "English-only .en models cannot be used with another/automatic language."
             )
         resolved_model = resolved_model.removesuffix(".en")
     print(f"Using Whisper model: {resolved_model}")
+
+    if args.input_file:
+        from transcript_tools import transcribe_file, export_transcription
+
+        result = transcribe_file(
+            args.input_file,
+            STTConfig(
+                resolved_model,
+                args.stt_backend,
+                "cuda" if torch.cuda.is_available() and not force_cpu else "cpu",
+                args.compute_type,
+            ),
+            language=None if args.auto_language or args.task == "translate" else args.language,
+            task=args.task,
+            initial_prompt=args.initial_prompt or None,
+        )
+        prefix = args.output or str(
+            Path("exports") / (Path(args.input_file).stem + "-" + time.strftime("%Y%m%d-%H%M%S"))
+        )
+        for path in export_transcription(result, prefix):
+            print(f"Saved: {path}")
+        print(result.get("text", ""))
+        return 0
 
     devices = list_input_devices()
     if devices:
@@ -922,6 +1433,13 @@ def main():
         auto_language=args.auto_language,
         run_mode=args.run_mode,
         log_transcripts=args.log_transcripts,
+        stt_backend=args.stt_backend,
+        compute_type=args.compute_type,
+        initial_prompt=args.initial_prompt,
+        elevenlabs_model=args.elevenlabs_model,
+        voice_speed=args.voice_speed,
+        max_clip_seconds=args.max_clip_seconds,
+        max_queue_seconds=args.max_queue_seconds,
     )
 
     if args.ui:

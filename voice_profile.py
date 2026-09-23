@@ -21,6 +21,8 @@ class VoiceProfile:
     peak: float
     gain: float
     silence_threshold: int
+    clipping_percent: float = 0.0
+    warnings: list[str] | None = None
 
 
 def _safe_float(value: float, default: float = 0.0) -> float:
@@ -30,6 +32,9 @@ def _safe_float(value: float, default: float = 0.0) -> float:
 
 
 def analyze_speaker_wav(path: str) -> VoiceProfile:
+    info = sf.info(path)
+    if info.duration > 60:
+        raise ValueError("Reference exceeds 60 seconds. Trim it to a clean single-speaker sample.")
     audio, sample_rate = sf.read(path, always_2d=False)
     if audio.ndim > 1:
         audio = np.mean(audio, axis=1)
@@ -44,6 +49,15 @@ def analyze_speaker_wav(path: str) -> VoiceProfile:
     peak = _safe_float(float(np.max(np.abs(audio))))
     target_rms = 0.12
     gain = 1.0 if rms == 0 else min(2.5, max(0.6, target_rms / rms))
+    gain = min(gain, 0.95 / peak)
+    clipping_percent = float(np.mean(np.abs(audio) >= 0.999) * 100)
+    warnings = []
+    if duration_s < 6:
+        warnings.append("Short reference: use at least 6 seconds of clean speech for XTTS.")
+    if clipping_percent > 0.1:
+        warnings.append("Reference contains clipped samples; record at a lower input gain.")
+    if rms < 0.01:
+        warnings.append("Reference is quiet; record closer to the microphone.")
     silence_threshold = max(200, int((rms * 32768) * 1.6))
     return VoiceProfile(
         sample_rate=sample_rate,
@@ -52,6 +66,8 @@ def analyze_speaker_wav(path: str) -> VoiceProfile:
         peak=peak,
         gain=gain,
         silence_threshold=silence_threshold,
+        clipping_percent=clipping_percent,
+        warnings=warnings,
     )
 
 

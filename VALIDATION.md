@@ -41,3 +41,36 @@ build dependency. Shared and cloud requirements subsequently installed successfu
 Homebrew's Tk installation was blocked by the Mac's unaccepted Xcode license. No
 license agreement was accepted; a pre-existing bundled Tk runtime was used to launch
 and inspect the process. A standard installation should use Python with Tk enabled.
+
+## Feature upgrade validation (September 23, 2026 UTC)
+
+This section supersedes the earlier UI-binding limitation and test count above.
+
+- 49 regression tests now pass locally, plus Ruff, compilation, diff checks and
+  `pip check`. New tests cover faster-whisper's lazy result adapter, uncertainty
+  warnings, subtitle exports and overwrite protection, source-grounded text
+  extraction, measured clipping, cancellation/mute, stale-queue drops, paginated
+  voice discovery, reference conditioning-cache invalidation, and new CLI flags.
+- Installed faster-whisper 1.2.1 / CTranslate2 and ran real `tiny.en` int8 CPU
+  inference. It recognized the complete synthetic test sentence in 2.40 seconds
+  after loading. This single sample does not establish a speed advantage.
+- The CLI file-transcription path generated valid JSON, UTF-8 text and SRT files
+  from real generated speech. The updated full live-processing worker was also
+  exercised using prerecorded PCM input, without opening a microphone or TTS.
+- Faster-whisper transcription diagnostics passed 10/10.
+- Native studio UI testing succeeded using the Homebrew Python app and pre-existing
+  bundled Tcl/Tk libraries. Verified tab navigation, diagnostics, file selection,
+  export destination selection, busy/Ready state transitions, restored controls,
+  transcript insights, and closing the window. Checked actual export files on disk.
+- Reference recording, calibration, live microphone capture, acoustic echo behavior,
+  XTTS synthesis, cloud synthesis/voice creation and real call routing are still
+  not validated end to end. Reference cache and cancellation behavior use provider
+  or device doubles in regression tests. No cloud credentials were used.
+- Translation is wired to the local model's translation task and validates model
+  selection, but no multilingual translation accuracy evaluation was performed.
+- The 8-second reference-recording tool has regression coverage for cancellation;
+  it was not used to capture the user's microphone during this upgrade.
+
+The project still has no generative conversation-assistant service. Summaries and
+candidate actions are explicitly labeled extractive English heuristics. Model
+weights, capabilities, accounts and hardware impose limits that tests cannot remove.

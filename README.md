@@ -59,7 +59,7 @@ devices, not microphone permissions, downloaded models, API account access or an
 actual call. `--help` also works without runtime dependencies.
 
 In the studio, choose the microphone and playback device, then **Start session**.
-**Stop** waits for the current inference or playback operation; it does not freeze
+**Stop** waits for active inference and interrupts playback between audio blocks; it does not freeze
 the window. Controls remain locked until workers exit, preventing overlapping
 sessions. Closing the window also waits for active work to finish.
 
@@ -78,7 +78,7 @@ Use a clean recording with one speaker. Silent/empty references are rejected.
 Files are read with libsndfile; WAV and FLAC are recommended. Support for compressed
 formats depends on the installed decoder. Reference gain does not determine the
 microphone's silence threshold. CLI mode calibrates ambient noise before listening;
-the studio uses a fixed RMS threshold of 500.
+the studio starts at an RMS threshold of 500 and offers calibration and a manual threshold in AI Settings.
 
 ## ElevenLabs
 
@@ -93,8 +93,7 @@ python voice_clone_app.py --engine elevenlabs --speaker-wav my_voice.wav --eleve
 Cloud mode sends recognized text to ElevenLabs. Cloning requires a suitable account
 plan. Both backends respect the selected playback device. ElevenLabs uses the v2
 SDK's text-to-speech and instant-voice-clone endpoints with 24 kHz PCM playback.
-Selecting a local reference from the panel is available only for the local engine;
-configure a cloud voice using the CLI options above.
+Local references are used by the local engine. Set the cloud voice ID and model in AI Settings, or use the CLI options above.
 
 ## Route to a call
 
@@ -124,7 +123,7 @@ For CLI routing, use `--device-index N --playback-device M`.
   still appears in the console and studio during a session.
 - `--profile-name NAME`: letters, digits, underscores and hyphens only, up to 64 characters.
 
-Capture keeps three chunks of pre-roll, bounds phrases to approximately 30 seconds,
+Capture keeps three chunks of pre-roll, bounds phrases to 30 seconds by default,
 and limits queued phrases to three. If processing falls behind, it drops a new clip
 and displays a warning. Shutdown discards queued clips and an unfinished recording.
 “Processing + playback latency” excludes capture time and time spent waiting in the queue.
@@ -151,3 +150,80 @@ Regression tests cover segmentation, overflow, startup failures, cleanup, diagno
 behavior, storage and provider contracts using simulated audio/providers. They do
 not establish live voice quality, real API access, or successful routing into a call.
 See `VALIDATION.md` for the checks actually performed on this revision.
+
+
+## Upgraded AI and audio tools
+
+The studio has **Audio & reference**, **AI settings**, and **Tools** tabs. Change the
+recognition engine, model, language (`en`, `es`, `fr`, or `auto`), vocabulary hint,
+noise reduction, voice engine, cloud voice/model IDs, voice speed and silence threshold
+before starting. During sessions, the input meter reports dBFS; phrase, drop and
+processing-time counters show pipeline health. **Mute voice** suppresses synthesis
+and interrupts output between blocks while keeping transcription active. An in-flight
+cloud request may already have incurred cost before it is muted.
+
+### Optional faster-whisper
+
+```sh
+python -m pip install -r requirements-fast.txt
+python voice_clone_app.py --stt-backend faster-whisper --model base.en --force-cpu --ui --run-mode test
+```
+
+This backend uses CTranslate2, defaults to CPU int8, and enables its Silero speech
+filter. `--compute-type float32` is an alternative on CPU; CUDA can also use float16
+or int8_float16 when supported by its runtime. It needs separately converted model
+weights and cannot load Whisper `.pt` files. Both engines download models on first use.
+Speed and accuracy vary; the optional backend is not guaranteed to outperform Whisper.
+See the [upstream backend documentation](https://github.com/SYSTRAN/faster-whisper).
+
+### Recording transcription, translation and subtitles
+
+```sh
+python voice_clone_app.py --input-file meeting.wav --model base --auto-language --output exports/meeting
+python voice_clone_app.py --input-file spanish.wav --model base --task translate --output exports/english
+```
+
+These commands never open a microphone or initialize a voice-synthesis engine.
+They produce `.json`, `.txt` and `.srt` files. Existing exports are protected from
+overwrite. Translation produces English text, requires a multilingual model, and
+is available in CLI file mode only. The studio's **Transcribe a recording** tool
+uses the current recognition settings and prompts for an export destination.
+Use `--initial-prompt "Acme, project terminology"` as a recognition vocabulary hint;
+it does not guarantee correct spelling.
+
+Exports include source-based summaries, candidate actions, questions and keywords.
+**Record an 8-second voice reference** saves a user-selected WAV and loads a normalized
+local reference; Stop cancels the recording without saving a partial file. References
+longer than 60 seconds are rejected before decoding.
+
+**View conversation insights** offers the same extraction for up to the last 200
+phrases in the current studio window and an explicit JSON export. These are English
+heuristics, not a generative assistant, speaker diarization, or verified commitments.
+Whisper uncertainty signals appear as warnings and are not calibrated confidence
+scores. VADER sentiment is disabled for detected non-English text.
+
+### Voice and diagnostic utilities
+
+```sh
+python voice_clone_app.py --inspect-reference my_voice.wav
+python voice_clone_app.py --list-voices
+python voice_clone_app.py --list-cloud-models
+python voice_clone_app.py --self-check --stt-backend faster-whisper --run-mode test --diagnostics-output readiness.json
+```
+
+The two cloud-listing commands require an ElevenLabs key and contact that service.
+They list account voices and currently available speech models without synthesizing
+speech. Use `--elevenlabs-model MODEL_ID` and `--voice-speed 1.0` to select output.
+Speed supports 0.7–1.2 for both voice engines.
+
+XTTS reuses one reference's conditioning in memory per session, invalidates it when
+the reference path/size/modification time changes, and does not serialize speaker
+embeddings. This uses the [documented XTTS inference interface](https://coqui-tts.readthedocs.io/en/latest/models/xtts.html).
+Reference checks warn about short, quiet or clipped samples. Normalization limits
+gain to preserve peak headroom. Live quality hints use measured levels/clipping and
+processing time; negative text sentiment no longer reduces the quality score.
+
+`--max-clip-seconds` controls maximum phrase length (1–60 seconds).
+`--max-queue-seconds` discards phrases that waited too long (10 seconds by default),
+preventing old speech from playing long after it was spoken. Noise reduction runs
+in the processing worker so it does not block microphone capture.

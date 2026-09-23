@@ -45,11 +45,11 @@ def _audio(kind):
     return devices
 
 
-def run_self_check(engine="local", run_mode="live"):
+def run_self_check(engine="local", run_mode="live", stt_backend="whisper"):
     modules = [
         "numpy",
         "torch",
-        "whisper",
+        "faster_whisper" if stt_backend == "faster-whisper" else "whisper",
         "noisereduce",
         "vaderSentiment",
         "soundfile",
