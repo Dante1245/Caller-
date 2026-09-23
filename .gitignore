@@ -3,3 +3,16 @@ __pycache__/
 output.mp3
 temp_audio.wav
 .env
+.venv/
+.pytest_cache/
+.ruff_cache/
+.env.*
+transcripts.txt
+usage_report.json
+voice_profiles.json
+normalized_speakers/
+sample_*.wav
+temp_*.wav
+*.egg-info/
+
+exports/

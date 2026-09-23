@@ -1,12 +1,10 @@
+"""Diagnostics work even when optional runtime dependencies are missing."""
+
 from __future__ import annotations
-
 import importlib
-from dataclasses import dataclass
-from typing import Any
-
-import pyaudio
-import sounddevice as sd
-import torch
+import shutil
+import sys
+from dataclasses import asdict, dataclass
 
 
 @dataclass
@@ -16,58 +14,76 @@ class CheckResult:
     detail: str
 
 
-def _check_import(module: str) -> CheckResult:
+def _check(name, action):
     try:
-        importlib.import_module(module)
-        return CheckResult(module, True, "import ok")
+        return CheckResult(name, True, str(action()))
     except Exception as exc:
-        return CheckResult(module, False, f"import failed: {exc}")
+        return CheckResult(name, False, f"{type(exc).__name__}: {exc}")
 
 
-def _check_audio_inputs() -> CheckResult:
-    pa = pyaudio.PyAudio()
-    count = pa.get_device_count()
-    inputs = [
-        pa.get_device_info_by_index(i)
-        for i in range(count)
-        if pa.get_device_info_by_index(i).get("maxInputChannels", 0) > 0
-    ]
-    pa.terminate()
-    ok = len(inputs) > 0
-    return CheckResult("pyaudio.input_devices", ok, f"inputs={len(inputs)}")
+def list_devices():
+    import sounddevice as sd
 
-
-def _check_audio_outputs() -> CheckResult:
     devices = sd.query_devices()
-    outputs = [d for d in devices if d.get("max_output_channels", 0) > 0]
-    ok = len(outputs) > 0
-    return CheckResult("sounddevice.output_devices", ok, f"outputs={len(outputs)}")
-
-
-def _check_torch() -> CheckResult:
-    cuda = torch.cuda.is_available()
-    return CheckResult("torch.cuda", True, f"cuda_available={cuda}")
-
-
-def run_self_check() -> list[CheckResult]:
-    results = [
-        _check_import("whisper"),
-        _check_import("TTS"),
-        _check_import("soundfile"),
-        _check_import("vaderSentiment"),
-        _check_import("elevenlabs"),
-        _check_torch(),
-        _check_audio_inputs(),
-        _check_audio_outputs(),
+    inputs = [
+        {"index": i, "name": d["name"]}
+        for i, d in enumerate(devices)
+        if d["max_input_channels"] > 0
     ]
+    outputs = [
+        {"index": i, "name": d["name"]}
+        for i, d in enumerate(devices)
+        if d["max_output_channels"] > 0
+    ]
+    return {"inputs": inputs, "outputs": outputs}
+
+
+def _audio(kind):
+    devices = list_devices()[kind]
+    if not devices:
+        raise RuntimeError(f"No {kind} devices detected")
+    return devices
+
+
+def run_self_check(engine="local", run_mode="live", stt_backend="whisper"):
+    modules = [
+        "numpy",
+        "torch",
+        "faster_whisper" if stt_backend == "faster-whisper" else "whisper",
+        "noisereduce",
+        "vaderSentiment",
+        "soundfile",
+        "sounddevice",
+    ]
+    if engine == "voice-changer" and run_mode == "live":
+        modules = ["numpy", "sounddevice"]
+    elif run_mode == "live":
+        modules.append("TTS.api" if engine == "local" else "elevenlabs")
+    results = [CheckResult("python", (3, 10) <= sys.version_info[:2] < (3, 14), sys.version)]
+    results += [_check(m, lambda m=m: importlib.import_module(m).__name__) for m in modules]
+    if engine != "voice-changer" or run_mode != "live":
+        results.append(
+            CheckResult(
+                "ffmpeg", shutil.which("ffmpeg") is not None, shutil.which("ffmpeg") or "Install ffmpeg"
+            )
+        )
+    results.append(_check("audio.inputs", lambda: _audio("inputs")))
+    if run_mode == "live":
+        results.append(_check("audio.outputs", lambda: _audio("outputs")))
+        if engine == "elevenlabs":
+            import os
+
+            present = bool(os.getenv("ELEVENLABS_API_KEY", "").strip())
+            results.append(
+                CheckResult(
+                    "elevenlabs.api_key", present, "Configured" if present else "Not configured"
+                )
+            )
     return results
 
 
-def render_report(results: list[CheckResult]) -> dict[str, Any]:
+def render_report(results):
     return {
-        "summary": {
-            "passed": sum(1 for r in results if r.ok),
-            "failed": sum(1 for r in results if not r.ok),
-        },
-        "results": [r.__dict__ for r in results],
+        "summary": {"passed": sum(r.ok for r in results), "failed": sum(not r.ok for r in results)},
+        "results": [asdict(r) for r in results],
     }
